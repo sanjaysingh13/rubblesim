@@ -1,0 +1,39 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>RubbleSim Web — rubble + void generation</title>
+    <style>
+      :root { color-scheme: dark; }
+      * { margin: 0; padding: 0; box-sizing: border-box; }
+      html, body { height: 100%; overflow: hidden; background: #0b0d10; font-family: system-ui, sans-serif; }
+      #app { position: fixed; inset: 0; }
+      #hud {
+        position: fixed; left: 12px; top: 12px; z-index: 10;
+        color: #cdd6e0; font-size: 12px; line-height: 1.5;
+        background: rgba(14,17,22,.72); border: 1px solid #222a33;
+        border-radius: 8px; padding: 10px 12px; max-width: 320px; pointer-events: none;
+      }
+      #hud b { color: #4fd6ff; }
+      #hud .k { color: #9fb0c0; }
+      #status { position: fixed; right: 12px; top: 12px; z-index: 10;
+        color: #4fd6ff; font-size: 12px; background: rgba(14,17,22,.72);
+        border: 1px solid #222a33; border-radius: 8px; padding: 6px 10px; }
+    </style>
+  </head>
+  <body>
+    <div id="app"></div>
+    <div id="hud">
+      <div><b>RubbleSim Web</b> — three.js + Rapier PoC</div>
+      <div class="k">Confined-space void generation for USAR</div>
+      <hr style="border-color:#222a33;margin:6px 0" />
+      <div><span class="k">Drag</span> orbit &nbsp; <span class="k">Scroll</span> zoom</div>
+      <div><span class="k">P</span> regenerate &nbsp; <span class="k">F</span> freeze now</div>
+      <div><span class="k">V</span> toggle void markers</div>
+      <div>Cyan wireframes = ground-truth voids</div>
+    </div>
+    <div id="status">booting…</div>
+    <script type="module" src="/src/main.js"></script>
+  </body>
+</html>
