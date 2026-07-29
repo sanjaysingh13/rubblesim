@@ -28,16 +28,24 @@ await page.mouse.move(640, 500);   // a second move so pointermove fires with a 
 await page.waitForTimeout(300);
 await page.screenshot({ path: `${OUT}/cut_2_tool.png` });
 
-// cut a square hole via a real RIGHT-CLICK on the slab under the blade
-await page.mouse.move(640, 500);
-await page.mouse.click(640, 500, { button: 'right' });
-await page.waitForTimeout(1500);              // plug drops + region re-settles
-await page.evaluate(() => window.__app.doFreeze());
-await page.waitForTimeout(300);
-const status2 = await page.evaluate(() => document.getElementById('status')?.textContent);
-const stats = await page.evaluate(() => { const s = window.__app.sim().stats; return { cuts: s.cuts, parts: window.__app.sim().parts.length }; });
+// TWO aimed right-clicks at different pixels — each hole must land where aimed (regression
+// for the "second cut goes to a random spot" bug).
+const cutAt = async (x, y) => {
+  await page.mouse.move(x, y); await page.mouse.move(x + 3, y + 2);
+  await page.mouse.click(x, y, { button: 'right' });
+  await page.waitForTimeout(1600); await page.evaluate(() => window.__app.doFreeze());
+  await page.waitForTimeout(200);
+  return page.evaluate(() => { const c = window.__app.lastCut(); return { x: +c.x.toFixed(2), y: +c.y.toFixed(2), z: +c.z.toFixed(2), cuts: window.__app.sim().stats.cuts }; });
+};
+const a = await cutAt(600, 470);
+const b = await cutAt(720, 520);
+const dist = Math.hypot(a.x - b.x, a.y - b.y, a.z - b.z);
+const stats = await page.evaluate(() => ({ parts: window.__app.sim().parts.length }));
 await page.screenshot({ path: `${OUT}/cut_3_hole.png` });
-console.log('after cut:', status2, JSON.stringify(stats));
+console.log('cut#1 @', a, '  cut#2 @', b);
+console.log(`cuts=${b.cuts}  parts=${stats.parts}  distance between the two holes=${dist.toFixed(2)} m`);
+console.log(dist > 0.4 ? 'OK: the two aimed cuts landed at different spots (not a fixed random fallback).'
+                       : 'WARN: the two cuts landed at ~the same spot — check aiming.');
 
 // hide the void markers so the hole is visible, then zoom the camera onto it
 await page.keyboard.press('v');

@@ -287,20 +287,6 @@ function updateBlade(clientX, clientY) {
   wasEngaged = engaged;
 }
 
-function slabOverVoid() {   // used by the Apply button / headless when the blade isn't on a slab
-  const voids = sim.voids || sim.detectVoids();
-  let best = null, bd = 1e9;
-  for (const v of voids) for (const p of sim.parts) {
-    if (p.kind !== 'slab' || p.frame || !p.mesh) continue;
-    const t = p.body.translation();
-    if (t.y <= v.y + 0.2) continue;
-    const d = Math.hypot(t.x - v.x, t.z - v.z);
-    if (d < 1.0 && t.y - v.y < bd) { bd = t.y - v.y; best = p; }
-  }
-  if (!best) { const s = sim.parts.filter((p) => p.kind === 'slab' && !p.frame); best = s.length ? s.reduce((a, b) => (b.body.translation().y > a.body.translation().y ? b : a), s[0]) : null; }
-  return best;
-}
-
 function setEquipment(label) {
   const tool = equipmentByLabel(label);
   blade.visible = !!tool; cutSquare.visible = false;
@@ -322,24 +308,28 @@ function applyEquipment() {
   if (!sim) return;
   const tool = equipmentByLabel(params.equipment);
   if (!tool) return;
-  ensureAudio(); startGrind(); setTimeout(stopGrind, 400);
+  if (!engaged) { setStatus('move the blade onto the rubble (rim turns GREEN), then right-click'); return; }
   if (tool.kind === 'hole') {
-    const slab = (engaged && hitPart && hitPart.kind === 'slab' && !hitPart.frame) ? hitPart : slabOverVoid();
-    if (!slab) { setStatus('put the blade on a grey slab (green rim), then right-click'); return; }
+    // Cut only where the blade actually is — an intact grey slab. No silent fallback.
+    if (!hitPart || hitPart.kind !== 'slab' || hitPart.frame) {
+      setStatus('aim at an intact grey slab (not a beam or an already-cut hole)');
+      return;
+    }
+    const slab = hitPart;
     slab.mesh.updateWorldMatrix(true, false);
-    const p = engaged ? hitPoint.clone() : slab.mesh.position.clone();
-    const local = slab.mesh.worldToLocal(p);
+    const local = slab.mesh.worldToLocal(hitPoint.clone());
     const res = sim.cutHoleInSlab(slab, local.x, local.z, params.holeSize / 2, params.holeSize / 2);
     if (!res) { setStatus('could not cut a hole there'); return; }
+    ensureAudio(); startGrind(); setTimeout(stopGrind, 400);
     lastCutWorld.set(res.holeWorld.x, res.holeWorld.y, res.holeWorld.z);
     addCutMarks([res.holeWorld]);
     settleDuration = params.cutSettleSeconds; phase = 'collapsing'; timer = 0;
     setStatus('✂ square hole cut — plug dropping into the void below');
   } else {
-    if (!engaged) { setStatus('move the blade over a joint (green rim), then right-click'); return; }
     tool.reach = params.cutReach;
     const res = tool.apply(sim, { point: { x: hitPoint.x, y: hitPoint.y, z: hitPoint.z }, normal: { x: hitNormal.x, y: hitNormal.y, z: hitNormal.z } });
     if (res.severed === 0) { setStatus('nothing to sever under the blade — aim at a joint between pieces'); return; }
+    ensureAudio(); startGrind(); setTimeout(stopGrind, 320);
     lastCutWorld.copy(hitPoint);
     addCutMarks(res.points);
     settleDuration = params.cutSettleSeconds; phase = 'collapsing'; timer = 0;
