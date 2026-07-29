@@ -3,6 +3,7 @@
 
 import * as THREE from 'three';
 import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
+import { mergeGeometries } from 'three/addons/utils/BufferGeometryUtils.js';
 import { STLExporter } from 'three/addons/exporters/STLExporter.js';
 import GUI from 'lil-gui';
 import RAPIER from '@dimforge/rapier3d-compat';
@@ -165,6 +166,25 @@ let phase = 'idle';
 let timer = 0;
 let settleDuration = 8;   // seconds of re-settling before auto-freeze (collapse vs cut)
 
+// merge a part's rebar rod descriptors {x,y,z,len,r,axis} into one thin-cylinder mesh
+function buildRebarMesh(rebars) {
+  if (!rebars || !rebars.length) return null;
+  const geoms = [];
+  for (const d of rebars) {
+    const g = new THREE.CylinderGeometry(d.r, d.r, d.len, 8, 1);   // cylinder is along +Y
+    if (d.axis === 'x') g.rotateZ(Math.PI / 2);
+    else if (d.axis === 'z') g.rotateX(Math.PI / 2);
+    g.translate(d.x, d.y, d.z);
+    geoms.push(g);
+  }
+  const merged = mergeGeometries(geoms, false);
+  geoms.forEach((g) => g.dispose());
+  if (!merged) return null;
+  const m = new THREE.Mesh(merged, MAT.rebar);
+  m.castShadow = true;
+  return m;
+}
+
 function onAdd(part) {
   const s = part.shape;
   const mesh = new THREE.Mesh(new THREE.BoxGeometry(s.hx * 2, s.hy * 2, s.hz * 2), MAT[part.matKind] || MAT.fragment);
@@ -172,15 +192,10 @@ function onAdd(part) {
   const t = part.body.translation(), r = part.body.rotation();
   mesh.position.set(t.x, t.y, t.z);
   mesh.quaternion.set(r.x, r.y, r.z, r.w);
-  // embedded rebar: child meshes that ride with the concrete piece (exposed when it separates)
-  if (part.rebars) {
-    for (const d of part.rebars) {
-      const bar = new THREE.Mesh(new THREE.BoxGeometry(d.hx * 2, d.hy * 2, d.hz * 2), MAT.rebar);
-      bar.position.set(d.x, d.y, d.z);
-      bar.castShadow = true;
-      mesh.add(bar);
-    }
-  }
+  // reinforcement: thin cylindrical rods (a grid in slabs; corner bars in columns/beams),
+  // merged into one child mesh that rides with the concrete piece.
+  const rb = buildRebarMesh(part.rebars);
+  if (rb) mesh.add(rb);
   part.mesh = mesh;
   mesh.userData.part = part;   // back-reference for picking
   structureGroup.add(mesh);

@@ -29,7 +29,8 @@ export const DEFAULTS = {
   furniturePerFloor: 3,
   colSegments: 3,
   beamSegments: 3,
-  rebarThickness: 0.045,
+  rebarThickness: 0.015,   // rebar rod RADIUS (~1.2 in dia)
+  rebarSpacing: 0.32,      // slab rebar grid spacing (m)
   // physics
   gravity: 40,
   restitution: 0.38,
@@ -170,13 +171,13 @@ export class RubbleSim {
     const crossAxes = ['x', 'y', 'z'].filter((a) => a !== axis);
     // reinforced-concrete columns carry a rebar cage: per-segment bars slightly longer than
     // the segment so they protrude (and stay attached) where the concrete snaps. Visual only.
+    // 4 thin longitudinal rebar rods at the corners, running the segment length.
     const segRebars = () => {
       if (!withRebar) return null;
       const bars = [];
       for (const [s1, s2] of [[-1, -1], [1, -1], [1, 1], [-1, 1]]) {
-        const d = { hx: th, hy: th, hz: th, x: 0, y: 0, z: 0 };
-        d['h' + axis] = seg / 2 * 1.15;
-        d[crossAxes[0]] = s1 * cross * 0.5;   // corner bars at the surface -> visible cage
+        const d = { x: 0, y: 0, z: 0, len: seg * 1.15, r: th, axis };
+        d[crossAxes[0]] = s1 * cross * 0.5;
         d[crossAxes[1]] = s2 * cross * 0.5;
         bars.push(d);
       }
@@ -217,12 +218,15 @@ export class RubbleSim {
       for (let i = 0; i < g; i++) {
         tiles[i] = [];
         for (let j = 0; j < g; j++) {
-          // top-surface rebar cross (reinforcement mesh), slightly oversized so it meets the
-          // neighbours / protrudes at a tear. Visual child descriptors, no physics.
-          const tileRebars = [
-            { hx: tileHalf * 1.05, hy: th, hz: th, x: 0, y: st / 2 + th, z: 0 },
-            { hx: th, hy: th, hz: tileHalf * 1.05, x: 0, y: st / 2 + th, z: 0 },
-          ];
+          // reinforcement mesh: a grid of thin cylindrical rods near the slab's top face.
+          const tileRebars = [];
+          const n = Math.max(2, Math.round((tileHalf * 2) / o.rebarSpacing));
+          const ry = st / 2;                     // near the top surface (exposed when concrete spalls)
+          for (let k = 0; k <= n; k++) {
+            const u = -tileHalf + (tileHalf * 2) * (k / n);
+            tileRebars.push({ x: 0, y: ry, z: u, len: tileHalf * 2, r: th, axis: 'x' });
+            tileRebars.push({ x: u, y: ry, z: 0, len: tileHalf * 2, r: th, axis: 'z' });
+          }
           tiles[i][j] = this._addBox({ hx: tileHalf, hy: st / 2, hz: tileHalf },
             { x: lines[i], y: slabY, z: lines[j] }, null, 'slab',
             { fixed: true, density: o.densityConcrete, events: true, rebars: tileRebars });

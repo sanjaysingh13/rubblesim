@@ -223,6 +223,13 @@ Rebar was only on slab tops; columns/beams had bars buried *inside* the section 
 - Visual-only (rebar descriptors + materials); densities unchanged, so the collapse tuning
   and all headless tests still hold. Confirmed with a standing-building screenshot (look.mjs).
 
+### 11b — rebar is a thin cylindrical GRID (corrected from fat bars)
+Reference photo: rebar = a dense grid lattice of thin (~0.5–1 in) cylindrical rods in the slab.
+My "2 fat boxes per tile" was wrong. Now: each slab carries a **grid of thin cylinder rods**
+(`rebarSpacing` 0.32 m, radius 0.015 m) near the top face; columns/beams get 4 thin
+longitudinal corner rods. Rebar descriptors are now `{x,y,z,len,r,axis}`; the renderer merges
+a part's rods into one cylinder mesh (`mergeGeometries`) to keep draw calls low. Rust-red.
+
 ## Gotchas / guardrails
 
 - **Black screen = a load-time exception, not a render bug.** Root cause once: `main.js`
