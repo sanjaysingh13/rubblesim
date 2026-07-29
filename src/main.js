@@ -19,7 +19,7 @@ const params = {
   settleSeconds: 8,
   showVoidMarkers: true,
   equipment: 'None',          // 'None' | 'Concrete cutter' | 'Rebar cutter'
-  cutReach: 0.7,              // rebar-cutter plane radius (m)
+  cutReach: 0.55,             // rebar-cutter mouth reach (m) — short (hydraulic pliers)
   holeSize: 0.6,             // concrete-cutter square side (m)
   cutSettleSeconds: 3,       // local re-settle time after a cut
   rebuild: () => rebuild(),
@@ -72,13 +72,37 @@ function makeBladeTexture(rim) {
     g.beginPath(); g.moveTo(cx + Math.cos(a) * r0, cy + Math.sin(a) * r0); g.lineTo(cx + Math.cos(a) * r1, cy + Math.sin(a) * r1); g.stroke(); }
   const tex = new THREE.CanvasTexture(cv); tex.anisotropy = 4; return tex;
 }
-const bladeTexFree = makeBladeTexture('#3a3f45');
-const bladeTexOn = makeBladeTexture('#33ff88');   // green rim = touching a surface
-const blade = new THREE.Sprite(new THREE.SpriteMaterial({ map: bladeTexFree, depthTest: false, transparent: true }));
+// Hydraulic rebar cutter — long pliers with a short mouth; the mouth/jaws go green when a
+// cuttable rebar is in reach. `jaw` colours the mouth.
+function makePliersTexture(jaw) {
+  const s = 256, cv = document.createElement('canvas'); cv.width = cv.height = s;
+  const g = cv.getContext('2d'); g.clearRect(0, 0, s, s); g.lineCap = 'round';
+  const pivot = [s * 0.5, s * 0.42];
+  // long handles
+  g.strokeStyle = '#2b2f33'; g.lineWidth = 20;
+  g.beginPath(); g.moveTo(s * 0.32, s * 0.96); g.lineTo(pivot[0], pivot[1]); g.stroke();
+  g.beginPath(); g.moveTo(s * 0.68, s * 0.96); g.lineTo(pivot[0], pivot[1]); g.stroke();
+  // hydraulic body
+  g.fillStyle = '#4a90d9'; g.fillRect(s * 0.40, s * 0.34, s * 0.20, s * 0.14);
+  // pivot bolt
+  g.fillStyle = '#111'; g.beginPath(); g.arc(pivot[0], pivot[1], s * 0.035, 0, Math.PI * 2); g.fill();
+  // SHORT mouth / jaws
+  g.strokeStyle = jaw; g.lineWidth = 14;
+  g.beginPath(); g.moveTo(pivot[0], pivot[1]); g.lineTo(s * 0.44, s * 0.20); g.stroke();
+  g.beginPath(); g.moveTo(pivot[0], pivot[1]); g.lineTo(s * 0.56, s * 0.20); g.stroke();
+  const tex = new THREE.CanvasTexture(cv); tex.anisotropy = 4; return tex;
+}
+
+const discFree = makeBladeTexture('#3a3f45');
+const discOn = makeBladeTexture('#33ff88');       // green rim = touching a surface
+const pliersFree = makePliersTexture('#9aa0a6');
+const pliersOn = makePliersTexture('#33ff88');    // green jaws = rebar in reach
+const blade = new THREE.Sprite(new THREE.SpriteMaterial({ map: discFree, depthTest: false, transparent: true }));
 blade.scale.set(1.0, 1.0, 1);
 blade.visible = false;
 blade.renderOrder = 999;
 scene.add(blade);
+let activeFreeTex = discFree, activeOnTex = discOn;   // set per tool in setEquipment
 
 // Concrete cutter: a square footprint (translucent green fill + outline) marking the hole to
 // be cut, laid on the slab under the blade.
@@ -268,10 +292,16 @@ function updateBlade(clientX, clientY) {
     hitPoint.copy(h.point);
     if (h.face) hitNormal.copy(h.face.normal).transformDirection(h.object.matrixWorld).normalize();
     hitPart = h.object.userData.part || (h.object.parent && h.object.parent.userData.part) || null;
-    engaged = true;
-    blade.position.copy(hitPoint).addScaledVector(hitNormal, 0.05);
     blade.material.opacity = 1;
-    if (toolKind() === 'hole') {
+    if (toolKind() === 'rebar') {
+      // engaged only when an exposed rebar (cracked fracture between slabs) is within the short mouth
+      const near = sim.exposedRebarNear(hitPoint, params.cutReach);
+      engaged = !!near;
+      const p = near || hitPoint;                       // snap the pliers to the rebar if found
+      blade.position.set(p.x, p.y, p.z).addScaledVector(hitNormal, 0.05);
+    } else {
+      engaged = true;
+      blade.position.copy(hitPoint).addScaledVector(hitNormal, 0.05);
       cutSquare.visible = true;
       cutSquare.position.copy(hitPoint).addScaledVector(hitNormal, 0.02);
       cutSquare.quaternion.setFromUnitVectors(_zAxis, hitNormal);
@@ -280,7 +310,7 @@ function updateBlade(clientX, clientY) {
     engaged = false; blade.material.opacity = 0.35; cutSquare.visible = false;
   }
   if (engaged !== wasEngaged) {
-    blade.material.map = engaged ? bladeTexOn : bladeTexFree;   // green rim = touching a surface
+    blade.material.map = engaged ? activeOnTex : activeFreeTex;   // green = ready to cut
     blade.material.needsUpdate = true;
     if (engaged) playContact();
   }
@@ -291,7 +321,9 @@ function setEquipment(label) {
   const tool = equipmentByLabel(label);
   blade.visible = !!tool; cutSquare.visible = false;
   engaged = false; wasEngaged = false;
-  blade.material.map = bladeTexFree; blade.material.needsUpdate = true;
+  activeFreeTex = tool && tool.kind === 'rebar' ? pliersFree : discFree;
+  activeOnTex = tool && tool.kind === 'rebar' ? pliersOn : discOn;
+  blade.material.map = activeFreeTex; blade.material.needsUpdate = true;
   // left-drag still orbits; free the RIGHT button so right-click can cut
   controls.mouseButtons.LEFT = THREE.MOUSE.ROTATE;
   controls.mouseButtons.RIGHT = tool ? null : THREE.MOUSE.PAN;
@@ -299,7 +331,7 @@ function setEquipment(label) {
   if (tool.kind === 'hole') refreshSquare();
   setStatus(tool.kind === 'hole'
     ? 'Concrete cutter — move the blade onto a slab (rim turns GREEN); RIGHT-CLICK to cut the marked square. Left-drag orbits.'
-    : 'Rebar cutter — move the blade over a joint (rim GREEN); RIGHT-CLICK to sever & free pieces. Left-drag orbits.');
+    : 'Rebar cutter — hover the exposed rebar in a fracture between slabs (jaws turn GREEN); RIGHT-CLICK to snip it. Left-drag orbits.');
 }
 
 // Cut now, at the blade (right-click / Apply / Enter): concrete = square hole (plug drops),
@@ -327,13 +359,13 @@ function applyEquipment() {
     setStatus('✂ square hole cut — plug dropping into the void below');
   } else {
     tool.reach = params.cutReach;
-    const res = tool.apply(sim, { point: { x: hitPoint.x, y: hitPoint.y, z: hitPoint.z }, normal: { x: hitNormal.x, y: hitNormal.y, z: hitNormal.z } });
-    if (res.severed === 0) { setStatus('nothing to sever under the blade — aim at a joint between pieces'); return; }
-    ensureAudio(); startGrind(); setTimeout(stopGrind, 320);
-    lastCutWorld.copy(hitPoint);
+    const res = tool.apply(sim, { point: { x: hitPoint.x, y: hitPoint.y, z: hitPoint.z } });
+    if (res.severed === 0) { setStatus('no exposed rebar in the mouth — hover a fracture between slab pieces (jaws go green)'); return; }
+    ensureAudio(); startGrind(); setTimeout(stopGrind, 300);
+    lastCutWorld.set(res.points[0].x, res.points[0].y, res.points[0].z);
     addCutMarks(res.points);
     settleDuration = params.cutSettleSeconds; phase = 'collapsing'; timer = 0;
-    setStatus(`✂ rebar cutter freed ${res.severed} connection(s) · ${res.woken} pieces dropping`);
+    setStatus(`✂ rebar snipped · ${res.woken} pieces separating & re-settling`);
   }
 }
 
@@ -391,7 +423,7 @@ fT.add(params, 'showVoidMarkers').onChange((v) => voidMarkers.forEach((m) => (m.
 const fEq = gui.addFolder('Equipment');
 fEq.add(params, 'equipment', ['None', 'Concrete cutter', 'Rebar cutter']).onChange(setEquipment);
 fEq.add(params, 'holeSize', 0.3, 1.5, 0.1).name('hole size (concrete)').onChange(() => refreshSquare());
-fEq.add(params, 'cutReach', 0.3, 3, 0.1).name('reach (rebar)');
+fEq.add(params, 'cutReach', 0.2, 1.0, 0.05).name('rebar reach (mouth)');
 fEq.add({ apply: () => applyEquipment() }, 'apply').name('Apply / cut (Enter)');
 gui.add(params, 'rebuild').name('Rebuild (P)');
 gui.add(params, 'collapseNow').name('Collapse (C)');
@@ -449,6 +481,17 @@ if (location.search.includes('test')) {
     params, setEquipment, applyEquipment, doCollapse, doFreeze,
     phase: () => phase, sim: () => sim, blade, camera, controls,
     lastCut: () => lastCutWorld,
+    // world point of the first exposed rebar (cracked tie) — for tests
+    firstRebar: () => {
+      for (const r of sim.joints) if (r.type === 'tie' && r.cracked && !r.broken && !r.a.dead && !r.b.dead) {
+        const a = r.a.body.translation(), b = r.b.body.translation();
+        return { x: (a.x + b.x) / 2, y: (a.y + b.y) / 2, z: (a.z + b.z) / 2 };
+      }
+      return null;
+    },
+    // project a world point to canvas pixel coords — for driving the mouse in tests
+    project: (p) => { const v = new THREE.Vector3(p.x, p.y, p.z).project(camera);
+      return { x: (v.x * 0.5 + 0.5) * innerWidth, y: (1 - (v.y * 0.5 + 0.5)) * innerHeight }; },
   };
 }
 

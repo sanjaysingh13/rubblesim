@@ -192,6 +192,25 @@ Audio is useless without speakers, so feedback is now visual and the trigger is 
 - Playwright now tests the real right-click path (`page.mouse.click(x,y,{button:'right'})`);
   green rim confirmed on-screen.
 
+## Iteration 10 — hydraulic rebar cutter (long pliers, short mouth)
+
+Second tool, per the real device: cuts the **exposed rebar in a fracture between slabs**.
+- **Model:** a fracture between slabs = a *cracked tie hinge* (the collapse leaves ~14 of
+  these — the rebar bridging two slab pieces). `sim.exposedRebarNear(point, reach)` finds the
+  nearest one; `sim.cutRebar` breaks that hinge (fully separating the pieces) + wakes locally.
+  Targets the **seam** (tile centre + its joint anchor, in world space), not the tile centre,
+  so hovering the visible fracture engages.
+- **UI:** a pliers sprite (long handles + hydraulic body + **short jaws**) that go **green when
+  an exposed rebar is within the short mouth** (reach ~0.55 m). Right-click snips it. Distinct
+  from the concrete disc; textures swap per tool via `activeFreeTex/activeOnTex`.
+- **Tool synergy:** collapse fractures concrete → rebar exposed in the seams → rebar cutter
+  snips it → pieces separate. (Concrete cutter opens holes; rebar cutter frees pieces.)
+- **Finding (again):** a snipped hinge barely moves *contact-supported* neighbours (~8 cm) —
+  the point is the cut, not spectacle. `verify-rebar.mjs` asserts on the break, not on motion.
+- **Test-harness note:** projecting the seam to a pixel + raycasting can land off the seam
+  (parallax on tilted slabs), so the automated screenshot showed grey jaws; engagement itself
+  is unit-verified (green on the fracture, off at 0.9 m). Interactive hovering works fine.
+
 ## Gotchas / guardrails
 
 - **Black screen = a load-time exception, not a render bug.** Root cause once: `main.js`

@@ -59,5 +59,20 @@ await page.evaluate(() => {
 await page.waitForTimeout(400);
 await page.screenshot({ path: `${OUT}/cut_4_closeup.png` });
 
+// --- rebar cutter: aim the pliers at an exposed rebar (cracked tie) and screenshot ---
+await page.keyboard.press('v');   // show void markers again off
+await page.evaluate(() => { window.__app.params.equipment = 'Rebar cutter'; window.__app.setEquipment('Rebar cutter'); });
+const rb = await page.evaluate(() => window.__app.firstRebar());
+if (rb) {
+  await page.evaluate((w) => { const { camera, controls } = window.__app; camera.position.set(w.x + 1.6, w.y + 1.3, w.z + 1.6); controls.target.set(w.x, w.y, w.z); controls.update(); }, rb);
+  await page.waitForTimeout(200);
+  const s = await page.evaluate((w) => window.__app.project(w), rb);   // reproject after camera move
+  await page.mouse.move(s.x, s.y); await page.mouse.move(s.x + 2, s.y + 1);
+  await page.waitForTimeout(200);
+  await page.screenshot({ path: `${OUT}/cut_5_rebar.png` });
+  const eng = await page.evaluate(() => document.getElementById('status')?.textContent);
+  console.log('rebar cutter aimed at exposed rebar @', rb, '| status:', eng);
+} else console.log('no exposed rebar found for the rebar-cutter screenshot');
+
 await browser.close();
 console.log('screenshots written to', OUT);

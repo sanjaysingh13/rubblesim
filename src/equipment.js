@@ -12,9 +12,10 @@ export const EQUIPMENT = [
     // completion handled by main.js -> sim.cutHoleInSlab (removes plug, leaves a hole)
   },
   {
-    id: 'rebarCutter', label: 'Rebar cutter', kind: 'plane', reach: 0.5,
-    // cuts rebar/steel: breaks every joint crossing the plane, fully freeing pieces so they drop
-    apply(sim, { point, normal }) { return sim.cut(point, normal, this.reach, { mode: 'rebar' }); },
+    id: 'rebarCutter', label: 'Rebar cutter', kind: 'rebar', reach: 0.4,
+    // hydraulic pliers: snip the exposed rebar in a fracture between slabs (short mouth = precise);
+    // breaks that hinge so the two pieces separate.
+    apply(sim, { point }) { return sim.cutRebar(point, this.reach); },
   },
 ];
 

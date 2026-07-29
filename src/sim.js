@@ -400,6 +400,40 @@ export class RubbleSim {
     return { severed, woken, points };
   }
 
+  // Exposed rebar = a cracked tie hinge (the rebar bridging a fracture between two slab
+  // pieces). Return the nearest one to `point` within `reach`, or null.
+  exposedRebarNear(point, reach) {
+    let best = null, bd = reach * reach;
+    for (const rec of this.joints) {
+      if (rec.type !== 'tie' || !rec.cracked || rec.broken || rec.a.dead || rec.b.dead) continue;
+      // the fracture/rebar sits at the shared seam = tile A centre + its anchor, in world space
+      const t = rec.a.body.translation(), o = rotateVec(rec.a.body.rotation(), rec.anchorA);
+      const x = t.x + o.x, y = t.y + o.y, z = t.z + o.z;
+      const d2 = (x - point.x) ** 2 + (y - point.y) ** 2 + (z - point.z) ** 2;
+      if (d2 <= bd) { bd = d2; best = { rec, x, y, z }; }
+    }
+    return best;
+  }
+
+  // Hydraulic rebar cutter: snip the exposed rebar nearest `point` — breaks that hinge so the
+  // two slab pieces separate — then wake the local region so they shift. Returns {severed,points,woken}.
+  cutRebar(point, reach) {
+    const near = this.exposedRebarNear(point, reach);
+    if (!near) return { severed: 0, points: [], woken: 0 };
+    this._breakJoint(near.rec);
+    const R = this.R, wake = Math.max(reach * 3, 1.5);
+    let woken = 0;
+    for (const p of this.parts) {
+      if (p.dead) continue;
+      const t = p.body.translation();
+      if (Math.hypot(t.x - near.x, t.y - near.y, t.z - near.z) <= wake) {
+        p.body.setBodyType(R.RigidBodyType.Dynamic, true); p.fixed = false; woken++;
+      }
+    }
+    this.stats.cuts++; this.phase = 'collapsing';
+    return { severed: 1, points: [{ x: near.x, y: near.y, z: near.z }], woken };
+  }
+
   // Concrete cutter: a completed square cut removes a plug from a slab tile, leaving a hole.
   // The tile keeps its rigid body (and all its rebar ties) — we just swap its single box
   // collider for a 4-box FRAME around the hole, and spawn the cut-out plug as a falling piece.
