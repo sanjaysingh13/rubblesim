@@ -7,6 +7,8 @@ import { STLExporter } from 'three/addons/exporters/STLExporter.js';
 import GUI from 'lil-gui';
 import RAPIER from '@dimforge/rapier3d-compat';
 import { RubbleSim, DEFAULTS } from './sim.js';
+import { equipmentById, equipmentByLabel } from './equipment.js';
+import { ensureAudio, playContact, startGrind, stopGrind } from './audio.js';
 
 const statusEl = document.getElementById('status');
 const setStatus = (t) => { statusEl.textContent = t; };
@@ -16,6 +18,10 @@ const params = {
   standSeconds: 1.2,
   settleSeconds: 8,
   showVoidMarkers: true,
+  equipment: 'None',          // 'None' | 'Concrete cutter' | 'Rebar cutter'
+  cutReach: 0.7,              // rebar-cutter plane radius (m)
+  holeSize: 0.6,             // concrete-cutter square side (m)
+  cutSettleSeconds: 3,       // local re-settle time after a cut
   rebuild: () => rebuild(),
   collapseNow: () => doCollapse(),
   freezeNow: () => doFreeze(),
@@ -43,6 +49,48 @@ camera.position.set(15, 12, 17);
 const controls = new OrbitControls(camera, renderer.domElement);
 controls.target.set(0, 4, 0);
 controls.enableDamping = true;
+
+// --- Equipment: a disc-cutter "blade" cursor you move over the rubble with the mouse ---
+// A circle (the blade) + handle, drawn to a canvas sprite; it billboards to face the camera
+// and sits where the mouse ray hits the rubble. Turns bright when touching a solid.
+// `rim` colours the disc circumference — grey when free, green when touching a surface.
+function makeBladeTexture(rim) {
+  const s = 256, cv = document.createElement('canvas'); cv.width = cv.height = s;
+  const g = cv.getContext('2d');
+  g.clearRect(0, 0, s, s);
+  // handle
+  g.strokeStyle = '#222'; g.lineWidth = 16; g.beginPath(); g.moveTo(s * 0.5, s * 0.52); g.lineTo(s * 0.86, s * 0.16); g.stroke();
+  g.strokeStyle = '#4a90d9'; g.lineWidth = 8; g.beginPath(); g.moveTo(s * 0.5, s * 0.52); g.lineTo(s * 0.86, s * 0.16); g.stroke();
+  // blade disc + circumference
+  g.beginPath(); g.arc(s * 0.42, s * 0.58, s * 0.34, 0, Math.PI * 2);
+  g.fillStyle = 'rgba(210,215,220,0.85)'; g.fill();
+  g.lineWidth = 12; g.strokeStyle = rim; g.stroke();
+  // arbor + teeth ticks
+  g.fillStyle = '#333'; g.beginPath(); g.arc(s * 0.42, s * 0.58, s * 0.05, 0, Math.PI * 2); g.fill();
+  g.strokeStyle = rim; g.lineWidth = 3;
+  for (let i = 0; i < 24; i++) { const a = (i / 24) * Math.PI * 2, r0 = s * 0.30, r1 = s * 0.34, cx = s * 0.42, cy = s * 0.58;
+    g.beginPath(); g.moveTo(cx + Math.cos(a) * r0, cy + Math.sin(a) * r0); g.lineTo(cx + Math.cos(a) * r1, cy + Math.sin(a) * r1); g.stroke(); }
+  const tex = new THREE.CanvasTexture(cv); tex.anisotropy = 4; return tex;
+}
+const bladeTexFree = makeBladeTexture('#3a3f45');
+const bladeTexOn = makeBladeTexture('#33ff88');   // green rim = touching a surface
+const blade = new THREE.Sprite(new THREE.SpriteMaterial({ map: bladeTexFree, depthTest: false, transparent: true }));
+blade.scale.set(1.0, 1.0, 1);
+blade.visible = false;
+blade.renderOrder = 999;
+scene.add(blade);
+
+// Concrete cutter: a square footprint (translucent green fill + outline) marking the hole to
+// be cut, laid on the slab under the blade.
+const cutSquare = new THREE.Group();
+cutSquare.visible = false;
+const squareFill = new THREE.Mesh(new THREE.PlaneGeometry(1, 1),
+  new THREE.MeshBasicMaterial({ color: 0x33ff88, transparent: true, opacity: 0.35, side: THREE.DoubleSide, depthTest: false, depthWrite: false }));
+const squareOutline = new THREE.LineSegments(new THREE.BufferGeometry(),
+  new THREE.LineBasicMaterial({ color: 0x33ff88, depthTest: false }));
+squareFill.renderOrder = 997; squareOutline.renderOrder = 998;
+cutSquare.add(squareFill, squareOutline);
+scene.add(cutSquare);
 
 scene.add(new THREE.HemisphereLight(0x9fbfff, 0x20160f, 0.75));
 const sun = new THREE.DirectionalLight(0xfff2e0, 2.3);
@@ -91,6 +139,7 @@ let sim;
 const voidMarkers = [];
 let phase = 'idle';
 let timer = 0;
+let settleDuration = 8;   // seconds of re-settling before auto-freeze (collapse vs cut)
 
 function onAdd(part) {
   const s = part.shape;
@@ -109,10 +158,26 @@ function onAdd(part) {
     }
   }
   part.mesh = mesh;
+  mesh.userData.part = part;   // back-reference for picking
   structureGroup.add(mesh);
 }
+function disposeMesh(obj) { obj.traverse((o) => { if (o.geometry) o.geometry.dispose(); }); }
 function onRemove(part) {
-  if (part.mesh) { structureGroup.remove(part.mesh); part.mesh.geometry.dispose(); part.mesh = null; }
+  if (part.mesh) { structureGroup.remove(part.mesh); disposeMesh(part.mesh); part.mesh = null; }
+}
+// after a hole is cut, rebuild the tile's mesh as a group of frame boxes (with the hole)
+function onReshape(part) {
+  if (part.mesh) { structureGroup.remove(part.mesh); disposeMesh(part.mesh); }
+  const g = new THREE.Group();
+  for (const b of part.frame) {
+    const box = new THREE.Mesh(new THREE.BoxGeometry(b.hx * 2, b.hy * 2, b.hz * 2), MAT[part.matKind] || MAT.slab);
+    box.position.set(b.x, b.y, b.z); box.castShadow = true; box.receiveShadow = true;
+    g.add(box);
+  }
+  const t = part.body.translation(), r = part.body.rotation();
+  g.position.set(t.x, t.y, t.z); g.quaternion.set(r.x, r.y, r.z, r.w);
+  g.userData.part = part; part.mesh = g;
+  structureGroup.add(g);
 }
 
 function clearMarkers() { for (const m of voidMarkers) markerGroup.remove(m); voidMarkers.length = 0; }
@@ -120,7 +185,7 @@ function clearMarkers() { for (const m of voidMarkers) markerGroup.remove(m); vo
 function rebuild() {
   if (sim) sim.dispose();
   clearMarkers();
-  sim = new RubbleSim(RAPIER, params, { onAdd, onRemove });
+  sim = new RubbleSim(RAPIER, params, { onAdd, onRemove, onReshape });
   const n = sim.build();
   phase = 'standing'; timer = 0;
   setStatus(`standing ${params.stories}-story building (${n} pieces) — collapse in ${params.standSeconds}s`);
@@ -128,7 +193,7 @@ function rebuild() {
 
 function doCollapse() {
   if (!sim || phase !== 'standing') return;
-  sim.collapse(); phase = 'collapsing'; timer = 0;
+  sim.collapse(); phase = 'collapsing'; timer = 0; settleDuration = params.settleSeconds;
   setStatus('collapsing…');
 }
 
@@ -146,8 +211,147 @@ function doFreeze() {
     markerGroup.add(m); voidMarkers.push(m);
   }
   phase = 'frozen';
-  setStatus(`frozen • ${sim.parts.length} pieces • ${sim.stats.fractures} slabs fractured • ${sim.stats.snaps} snaps • ${voids.length} internal voids`);
+  setStatus(`frozen • ${sim.parts.length} pieces • ${sim.stats.cracks} slab cracks • ${sim.stats.snaps} snaps • ${sim.stats.cuts} cuts • ${voids.length} voids`);
 }
+
+// ---------------------------------------------------------------------------
+// Equipment — a disc-cutter "blade" you move over the rubble with the mouse.
+//   • touch a solid   -> contact tick + the blade brightens
+//   • HOLD left mouse  -> grinding sound; concrete cutter grinds a square hole (plug drops
+//                          into the void), rebar cutter severs the joints under the blade.
+//   right-drag still orbits the camera.
+// ---------------------------------------------------------------------------
+const cutFx = [];  // fading spark markers: { mesh, ttl }
+function addCutMarks(points) {
+  for (const p of points) {
+    const m = new THREE.Mesh(new THREE.SphereGeometry(0.16, 12, 8),
+      new THREE.MeshBasicMaterial({ color: 0xffdd33, transparent: true, opacity: 0.95, depthTest: false }));
+    m.position.set(p.x, p.y, p.z);
+    markerGroup.add(m); cutFx.push({ mesh: m, ttl: 1.8 });
+  }
+}
+function updateCutFx(dt) {
+  for (let i = cutFx.length - 1; i >= 0; i--) {
+    const fx = cutFx[i]; fx.ttl -= dt;
+    if (fx.ttl <= 0) { markerGroup.remove(fx.mesh); fx.mesh.geometry.dispose(); cutFx.splice(i, 1); }
+    else { fx.mesh.material.opacity = 0.95 * (fx.ttl / 1.8); fx.mesh.scale.setScalar(1 + (1.8 - fx.ttl)); }
+  }
+}
+
+// square footprint marking the hole to be cut (green fill + outline)
+function refreshSquare() {
+  const h = params.holeSize / 2;
+  const c = [[-h, -h], [h, -h], [h, h], [-h, h], [-h, -h]], edges = [];
+  for (let i = 0; i < 4; i++) edges.push(new THREE.Vector3(c[i][0], c[i][1], 0), new THREE.Vector3(c[i + 1][0], c[i + 1][1], 0));
+  squareOutline.geometry.setFromPoints(edges);
+  squareFill.scale.set(params.holeSize, params.holeSize, 1);
+}
+
+// --- blade cursor + engagement state ---
+const raycaster = new THREE.Raycaster();
+const ndc = new THREE.Vector2();
+const _zAxis = new THREE.Vector3(0, 0, 1);
+let engaged = false, wasEngaged = false, hitPart = null;
+const hitPoint = new THREE.Vector3(), hitNormal = new THREE.Vector3(0, 1, 0);
+const lastCutWorld = new THREE.Vector3();   // world position of the last cut (for camera framing/tests)
+const toolKind = () => { const t = equipmentByLabel(params.equipment); return t ? t.kind : null; };
+const toolActive = () => params.equipment !== 'None';
+
+function updateBlade(clientX, clientY) {
+  if (!toolActive() || !sim) return;
+  const r = renderer.domElement.getBoundingClientRect();
+  ndc.set(((clientX - r.left) / r.width) * 2 - 1, -((clientY - r.top) / r.height) * 2 + 1);
+  raycaster.setFromCamera(ndc, camera);
+  const hits = raycaster.intersectObjects(structureGroup.children, true);
+  if (hits.length) {
+    const h = hits[0];
+    hitPoint.copy(h.point);
+    if (h.face) hitNormal.copy(h.face.normal).transformDirection(h.object.matrixWorld).normalize();
+    hitPart = h.object.userData.part || (h.object.parent && h.object.parent.userData.part) || null;
+    engaged = true;
+    blade.position.copy(hitPoint).addScaledVector(hitNormal, 0.05);
+    blade.material.opacity = 1;
+    if (toolKind() === 'hole') {
+      cutSquare.visible = true;
+      cutSquare.position.copy(hitPoint).addScaledVector(hitNormal, 0.02);
+      cutSquare.quaternion.setFromUnitVectors(_zAxis, hitNormal);
+    }
+  } else {
+    engaged = false; blade.material.opacity = 0.35; cutSquare.visible = false;
+  }
+  if (engaged !== wasEngaged) {
+    blade.material.map = engaged ? bladeTexOn : bladeTexFree;   // green rim = touching a surface
+    blade.material.needsUpdate = true;
+    if (engaged) playContact();
+  }
+  wasEngaged = engaged;
+}
+
+function slabOverVoid() {   // used by the Apply button / headless when the blade isn't on a slab
+  const voids = sim.voids || sim.detectVoids();
+  let best = null, bd = 1e9;
+  for (const v of voids) for (const p of sim.parts) {
+    if (p.kind !== 'slab' || p.frame || !p.mesh) continue;
+    const t = p.body.translation();
+    if (t.y <= v.y + 0.2) continue;
+    const d = Math.hypot(t.x - v.x, t.z - v.z);
+    if (d < 1.0 && t.y - v.y < bd) { bd = t.y - v.y; best = p; }
+  }
+  if (!best) { const s = sim.parts.filter((p) => p.kind === 'slab' && !p.frame); best = s.length ? s.reduce((a, b) => (b.body.translation().y > a.body.translation().y ? b : a), s[0]) : null; }
+  return best;
+}
+
+function setEquipment(label) {
+  const tool = equipmentByLabel(label);
+  blade.visible = !!tool; cutSquare.visible = false;
+  engaged = false; wasEngaged = false;
+  blade.material.map = bladeTexFree; blade.material.needsUpdate = true;
+  // left-drag still orbits; free the RIGHT button so right-click can cut
+  controls.mouseButtons.LEFT = THREE.MOUSE.ROTATE;
+  controls.mouseButtons.RIGHT = tool ? null : THREE.MOUSE.PAN;
+  if (!tool) { setStatus('equipment: none'); return; }
+  if (tool.kind === 'hole') refreshSquare();
+  setStatus(tool.kind === 'hole'
+    ? 'Concrete cutter — move the blade onto a slab (rim turns GREEN); RIGHT-CLICK to cut the marked square. Left-drag orbits.'
+    : 'Rebar cutter — move the blade over a joint (rim GREEN); RIGHT-CLICK to sever & free pieces. Left-drag orbits.');
+}
+
+// Cut now, at the blade (right-click / Apply / Enter): concrete = square hole (plug drops),
+// rebar = sever every joint under the blade (pieces drop).
+function applyEquipment() {
+  if (!sim) return;
+  const tool = equipmentByLabel(params.equipment);
+  if (!tool) return;
+  ensureAudio(); startGrind(); setTimeout(stopGrind, 400);
+  if (tool.kind === 'hole') {
+    const slab = (engaged && hitPart && hitPart.kind === 'slab' && !hitPart.frame) ? hitPart : slabOverVoid();
+    if (!slab) { setStatus('put the blade on a grey slab (green rim), then right-click'); return; }
+    slab.mesh.updateWorldMatrix(true, false);
+    const p = engaged ? hitPoint.clone() : slab.mesh.position.clone();
+    const local = slab.mesh.worldToLocal(p);
+    const res = sim.cutHoleInSlab(slab, local.x, local.z, params.holeSize / 2, params.holeSize / 2);
+    if (!res) { setStatus('could not cut a hole there'); return; }
+    lastCutWorld.set(res.holeWorld.x, res.holeWorld.y, res.holeWorld.z);
+    addCutMarks([res.holeWorld]);
+    settleDuration = params.cutSettleSeconds; phase = 'collapsing'; timer = 0;
+    setStatus('✂ square hole cut — plug dropping into the void below');
+  } else {
+    if (!engaged) { setStatus('move the blade over a joint (green rim), then right-click'); return; }
+    tool.reach = params.cutReach;
+    const res = tool.apply(sim, { point: { x: hitPoint.x, y: hitPoint.y, z: hitPoint.z }, normal: { x: hitNormal.x, y: hitNormal.y, z: hitNormal.z } });
+    if (res.severed === 0) { setStatus('nothing to sever under the blade — aim at a joint between pieces'); return; }
+    lastCutWorld.copy(hitPoint);
+    addCutMarks(res.points);
+    settleDuration = params.cutSettleSeconds; phase = 'collapsing'; timer = 0;
+    setStatus(`✂ rebar cutter freed ${res.severed} connection(s) · ${res.woken} pieces dropping`);
+  }
+}
+
+renderer.domElement.addEventListener('contextmenu', (e) => { if (toolActive()) e.preventDefault(); });
+renderer.domElement.addEventListener('pointermove', (e) => updateBlade(e.clientX, e.clientY));
+renderer.domElement.addEventListener('pointerdown', (e) => {
+  if (e.button === 2 && toolActive()) { e.preventDefault(); updateBlade(e.clientX, e.clientY); applyEquipment(); }
+});
 
 // ---------------------------------------------------------------------------
 // Exports
@@ -191,8 +395,14 @@ fF.add(params, 'maxBreaksPerMember', 0, 3, 1).name('max snaps / member');
 const fT = gui.addFolder('Timing / voids');
 fT.add(params, 'standSeconds', 0, 5, 0.2);
 fT.add(params, 'settleSeconds', 3, 15, 0.5);
+fT.add(params, 'cutSettleSeconds', 1, 8, 0.5).name('cut re-settle secs');
 fT.add(params, 'minVoidHeight', 0.3, 1.5, 0.05);
 fT.add(params, 'showVoidMarkers').onChange((v) => voidMarkers.forEach((m) => (m.visible = v)));
+const fEq = gui.addFolder('Equipment');
+fEq.add(params, 'equipment', ['None', 'Concrete cutter', 'Rebar cutter']).onChange(setEquipment);
+fEq.add(params, 'holeSize', 0.3, 1.5, 0.1).name('hole size (concrete)').onChange(() => refreshSquare());
+fEq.add(params, 'cutReach', 0.3, 3, 0.1).name('reach (rebar)');
+fEq.add({ apply: () => applyEquipment() }, 'apply').name('Apply / cut (Enter)');
 gui.add(params, 'rebuild').name('Rebuild (P)');
 gui.add(params, 'collapseNow').name('Collapse (C)');
 gui.add(params, 'freezeNow').name('Freeze now (F)');
@@ -205,6 +415,7 @@ addEventListener('keydown', (e) => {
   else if (k === 'c') doCollapse();
   else if (k === 'f') doFreeze();
   else if (k === 'v') { params.showVoidMarkers = !params.showVoidMarkers; voidMarkers.forEach((m) => (m.visible = params.showVoidMarkers)); }
+  else if (k === 'enter') applyEquipment();
 });
 
 // ---------------------------------------------------------------------------
@@ -233,12 +444,22 @@ function tick() {
     sim.step();
     syncMeshes();
     timer += dt;
-    if (timer >= params.settleSeconds) doFreeze();
+    if (timer >= settleDuration) doFreeze();
   }
 
+  if (cutFx.length) updateCutFx(dt);
   controls.update();
   renderer.render(scene, camera);
   requestAnimationFrame(tick);
+}
+
+// Test hook (only with ?test in the URL) so Playwright can drive the tools headlessly.
+if (location.search.includes('test')) {
+  window.__app = {
+    params, setEquipment, applyEquipment, doCollapse, doFreeze,
+    phase: () => phase, sim: () => sim, blade, camera, controls,
+    lastCut: () => lastCutWorld,
+  };
 }
 
 await RAPIER.init();

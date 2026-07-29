@@ -47,6 +47,7 @@ export const DEFAULTS = {
   slabCrackForce: 2800,    // hard impact cracks one concrete seam -> rebar hinge (sparse cracks = large pieces)
   slabTearAngle: 0.7,      // extreme fold where the REBAR itself tears (rare, full separation)
   maxBreaksPerMember: 1,   // members snap into at most 2 pieces (never shatter)
+  wakeRadius: 3.0,         // radius of pieces re-woken to re-settle after an equipment cut
   maxParts: 2500,
   // void detection
   voidGrid: 9,
@@ -64,6 +65,15 @@ const relAngle = (qa, qb) => {
   const r = qMul(qConj(qa), qb);
   return 2 * Math.acos(Math.min(1, Math.abs(r.w)));
 };
+// rotate a vector by a unit quaternion
+const rotateVec = (q, v) => {
+  const tx = 2 * (q.y * v.z - q.z * v.y), ty = 2 * (q.z * v.x - q.x * v.z), tz = 2 * (q.x * v.y - q.y * v.x);
+  return {
+    x: v.x + q.w * tx + (q.y * tz - q.z * ty),
+    y: v.y + q.w * ty + (q.z * tx - q.x * tz),
+    z: v.z + q.w * tz + (q.x * ty - q.y * tx),
+  };
+};
 
 export class RubbleSim {
   constructor(RAPIER, opts = {}, callbacks = {}) {
@@ -71,6 +81,7 @@ export class RubbleSim {
     this.opts = { ...DEFAULTS, ...opts };
     this.onAdd = callbacks.onAdd || (() => {});
     this.onRemove = callbacks.onRemove || (() => {});
+    this.onReshape = callbacks.onReshape || (() => {}); // renderer rebuilds a part's mesh after a hole is cut
     this.phase = 'idle';
     this._init();
   }
@@ -92,7 +103,7 @@ export class RubbleSim {
     this.joints = [];        // records: {joint, a, b, type:'member'|'tie', breakAngle, member?, broken}
     this.colliderToPart = new Map();
     this.rng = makeRng(this.opts.seed);
-    this.stats = { snaps: 0, cracks: 0, tears: 0, maxForce: 0, maxBend: 0 };
+    this.stats = { snaps: 0, cracks: 0, tears: 0, cuts: 0, maxForce: 0, maxBend: 0 };
   }
 
   clear() { for (const p of this.parts) this.onRemove(p); this.world.free(); this.events.free(); this._init(); }
@@ -115,7 +126,7 @@ export class RubbleSim {
       .setRestitution(this.opts.restitution).setFriction(this.opts.friction).setDensity(density);
     if (events) cd = cd.setActiveEvents(R.ActiveEvents.CONTACT_FORCE_EVENTS).setContactForceEventThreshold(this.opts.contactEventThreshold);
     const col = this.world.createCollider(cd, body);
-    const part = { body, col, shape, matKind, kind: matKind, fixed, member, rebars };
+    const part = { body, col, colliders: [col], shape, matKind, kind: matKind, fixed, member, rebars };
     this.parts.push(part);
     this.colliderToPart.set(col.handle, part);
     this.onAdd(part);
@@ -132,15 +143,19 @@ export class RubbleSim {
     return rec;
   }
 
-  // concrete cracks: replace a rigid tie with a revolute HINGE along the crack line, so the
-  // slab pieces fold but stay connected by "rebar" (removed only if later torn).
-  _crackTie(rec) {
+  // concrete cracks: replace a rigid weld with a revolute HINGE along `hingeAxis`, so the
+  // pieces fold but stay connected by "rebar" (removed only if later torn/cut through).
+  _crackJoint(rec, hingeAxis) {
+    if (rec.cracked || rec.broken) return;
     this.world.removeImpulseJoint(rec.joint, true);
-    const jd = this.R.JointData.revolute(rec.anchorA, rec.anchorB, rec.hingeAxis);
+    const jd = this.R.JointData.revolute(rec.anchorA, rec.anchorB, hingeAxis);
     rec.joint = this.world.createImpulseJoint(jd, rec.a.body, rec.b.body, true);
+    rec.hingeAxis = hingeAxis;
     rec.cracked = true;
     this.stats.cracks++;
   }
+
+  _crackTie(rec) { this._crackJoint(rec, rec.hingeAxis); }
 
   // stiff linear member (column/beam): chain of box segments held by snap-able fixed joints
   _member(kind, from, to, cross, nSeg, density, withRebar) {
@@ -256,7 +271,7 @@ export class RubbleSim {
   _removePart(p) {
     if (p.dead) return;
     p.dead = true;
-    if (p.col) this.colliderToPart.delete(p.col.handle);
+    for (const c of (p.colliders || [])) this.colliderToPart.delete(c.handle);
     this.world.removeRigidBody(p.body);
     const i = this.parts.indexOf(p); if (i >= 0) this.parts.splice(i, 1);
     this.onRemove(p);
@@ -326,6 +341,120 @@ export class RubbleSim {
       else p.body.setBodyType(R.RigidBodyType.Fixed, true);
     }
     this.phase = 'frozen';
+  }
+
+  // Plane cut used by equipment. mode 'concrete' cracks rigid CONCRETE joints (slab ties + RC
+  // column welds) into rebar hinges (pieces fold but stay attached; steel beams untouched).
+  // mode 'rebar' fully BREAKS every joint crossing the plane (ties, hinges, steel members) —
+  // the rebar/steel cutter that frees pieces so they drop. Then re-wake the local region so
+  // gravity re-settles it. Returns {severed, woken, points}.
+  cut(point, normal, radius, opts = {}) {
+    const R = this.R;
+    const mode = opts.mode || 'concrete';
+    const wake = Math.max(radius, opts.wakeRadius ?? this.opts.wakeRadius);
+    const nl = Math.hypot(normal.x, normal.y, normal.z) || 1;
+    const n = { x: normal.x / nl, y: normal.y / nl, z: normal.z / nl };
+    const side = (p) => (p.x - point.x) * n.x + (p.y - point.y) * n.y + (p.z - point.z) * n.z;
+    const dist = (p) => Math.hypot(p.x - point.x, p.y - point.y, p.z - point.z);
+
+    let severed = 0;
+    const points = [];                                     // world positions of cut joints (UI feedback)
+    for (const rec of this.joints) {
+      if (rec.broken || rec.a.dead || rec.b.dead) continue;
+      if (mode === 'concrete') {
+        if (rec.cracked) continue;
+        const isConcrete = rec.type === 'tie' || (rec.type === 'member' && rec.member && rec.member.kind === 'column');
+        if (!isConcrete) continue;
+      } else if (rec.type !== 'tie' && rec.type !== 'member') continue; // rebar: any structural joint
+      const pa = rec.a.body.translation(), pb = rec.b.body.translation();
+      const mid = { x: (pa.x + pb.x) / 2, y: (pa.y + pb.y) / 2, z: (pa.z + pb.z) / 2 };
+      if (dist(mid) > radius) continue;
+      const sa = side(pa), sb = side(pb);
+      if (sa > 0 === sb > 0) continue;                     // must straddle the cut plane
+      if (mode === 'concrete') {
+        let axis = rec.hingeAxis;
+        if (rec.type === 'member') {                        // column fold axis in the cut plane
+          const ax = { x: pb.x - pa.x, y: pb.y - pa.y, z: pb.z - pa.z };
+          const hx = ax.y * n.z - ax.z * n.y, hy = ax.z * n.x - ax.x * n.z, hz = ax.x * n.y - ax.y * n.x;
+          const hl = Math.hypot(hx, hy, hz);
+          axis = hl > 1e-6 ? { x: hx / hl, y: hy / hl, z: hz / hl } : { x: 1, y: 0, z: 0 };
+        }
+        this._crackJoint(rec, axis);
+      } else {
+        this._breakJoint(rec);
+      }
+      points.push(mid);
+      severed++;
+    }
+
+    let woken = 0;
+    for (const p of this.parts) {
+      if (p.dead) continue;
+      if (dist(p.body.translation()) <= wake) {
+        p.body.setBodyType(R.RigidBodyType.Dynamic, true);
+        p.fixed = false;
+        woken++;
+      }
+    }
+    if (severed > 0 || woken > 0) { this.stats.cuts++; this.phase = 'collapsing'; }
+    return { severed, woken, points };
+  }
+
+  // Concrete cutter: a completed square cut removes a plug from a slab tile, leaving a hole.
+  // The tile keeps its rigid body (and all its rebar ties) — we just swap its single box
+  // collider for a 4-box FRAME around the hole, and spawn the cut-out plug as a falling piece.
+  // holeCx/holeCz = hole centre in the tile's LOCAL frame; rx/rz = hole half-sizes.
+  cutHoleInSlab(slab, holeCx, holeCz, rx, rz) {
+    if (!slab || slab.dead || slab.frame) return null;
+    const R = this.R, o = this.opts, s = slab.shape;
+    const m = 0.06;                                        // keep a minimum frame border
+    rx = Math.min(rx, s.hx - m); rz = Math.min(rz, s.hz - m);
+    holeCx = Math.max(-s.hx + rx + m, Math.min(s.hx - rx - m, holeCx));
+    holeCz = Math.max(-s.hz + rz + m, Math.min(s.hz - rz - m, holeCz));
+
+    // 4 frame boxes (left/right full-depth in Z; front/back only across the hole's X span)
+    const frame = [
+      { hx: (holeCx - rx + s.hx) / 2, hy: s.hy, hz: s.hz, x: (-s.hx + holeCx - rx) / 2, y: 0, z: 0 },
+      { hx: (s.hx - holeCx - rx) / 2, hy: s.hy, hz: s.hz, x: (s.hx + holeCx + rx) / 2, y: 0, z: 0 },
+      { hx: rx, hy: s.hy, hz: (holeCz - rz + s.hz) / 2, x: holeCx, y: 0, z: (-s.hz + holeCz - rz) / 2 },
+      { hx: rx, hy: s.hy, hz: (s.hz - holeCz - rz) / 2, x: holeCx, y: 0, z: (s.hz + holeCz + rz) / 2 },
+    ].filter((b) => b.hx > 0.02 && b.hz > 0.02);
+
+    // swap colliders on the SAME body (joints/ties preserved)
+    for (const c of slab.colliders) { this.colliderToPart.delete(c.handle); this.world.removeCollider(c, true); }
+    slab.colliders = [];
+    for (const b of frame) {
+      const cd = R.ColliderDesc.cuboid(b.hx, b.hy, b.hz).setTranslation(b.x, b.y, b.z)
+        .setRestitution(o.restitution).setFriction(o.friction).setDensity(o.densityConcrete);
+      const c = this.world.createCollider(cd, slab.body);
+      slab.colliders.push(c);
+      this.colliderToPart.set(c.handle, slab);
+    }
+    slab.col = slab.colliders[0] || null;
+    slab.frame = frame;                                    // renderer rebuilds mesh from this
+    slab.rebars = null;
+    this.onReshape(slab);
+
+    // spawn the plug at the hole location (tile local -> world), a touch smaller than the hole
+    // so it isn't wedged against the frame edges, as a falling piece
+    const t = slab.body.translation(), q = slab.body.rotation();
+    const off = rotateVec(q, { x: holeCx, y: 0, z: holeCz });
+    const plug = this._addBox({ hx: rx * 0.9, hy: s.hy * 0.95, hz: rz * 0.9 },
+      { x: t.x + off.x, y: t.y + off.y, z: t.z + off.z }, q, 'fragment',
+      { fixed: false, density: o.densityConcrete });
+
+    // wake the local region so the plug and nearby debris re-settle
+    const wc = { x: t.x + off.x, y: t.y + off.y, z: t.z + off.z };
+    for (const p of this.parts) {
+      if (p.dead || p === slab) continue;
+      const pt = p.body.translation();
+      if (Math.hypot(pt.x - wc.x, pt.y - wc.y, pt.z - wc.z) <= this.opts.wakeRadius) {
+        p.body.setBodyType(R.RigidBodyType.Dynamic, true); p.fixed = false;
+      }
+    }
+    this.stats.cuts++;
+    this.phase = 'collapsing';
+    return { plug, holeWorld: wc };
   }
 
   // ray-march vertical lines; enclosed empty gaps (solid above) are internal voids

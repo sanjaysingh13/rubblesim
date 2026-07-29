@@ -93,6 +93,105 @@ Driven by real USAR collapse photos:
 
 ---
 
+## Iteration 7 — rescue equipment: concrete cutter
+
+First tool in an extensible **equipment registry** (`src/equipment.js`). User positions a cut
+plane with a **3D gizmo** and applies it; the cut disturbs the rubble's equilibrium.
+
+- **Cut = crack, not sever (concrete-only).** `sim.cut(point, normal, radius)` converts the
+  rigid CONCRETE joints crossing the cut plane within `radius` (slab ties + RC column welds)
+  into **revolute rebar hinges** (reusing `_crackJoint`, generalized from `_crackTie`). Pieces
+  fold/sag but stay attached — fully freeing them is a future rebar cutter. **Steel beams are
+  skipped** (concrete cutter can't cut steel) — this is the hook for future tool differentiation.
+- **Local re-settle.** After cutting, wake every piece within `wakeRadius` (~3 m) of the cut to
+  Dynamic and set `phase='collapsing'`; the renderer re-settles for `cutSettleSeconds` (~3 s)
+  then re-freezes and re-detects voids. Rest of the pile stays Fixed = local disturbance model.
+- **Finding — where you cut matters.** After a collapse most slab ties near the *top* are
+  already cracked (hinges) from impact, so cutting there does nothing (correct: no concrete
+  left, only rebar). A cut only bites on still-**rigid** seams. `verify-cut.mjs` targets a
+  rigid tie to be deterministic.
+- **Finding — a single precise cut on a settled pile moves things little (~15–20 mm).**
+  Physically honest: pieces rest on each other (contact-supported), so converting one seam to
+  a hinge barely shifts them. Bigger effect needs a larger reach / multiple cuts / a
+  load-bearing spot. The headless assert uses a realistic 10 mm movement threshold + explosion guard.
+- **Gizmo:** three.js `TransformControls`. In three 0.161 it *is* an `Object3D` → `scene.add(tc)`
+  (later versions need `tc.getHelper()` — check the version). Wire `'dragging-changed'` to
+  `controls.enabled = !value` so OrbitControls doesn't fight the gizmo. Cut normal = tool local +Z.
+- Verified: `node verify-cut.mjs` → severed 2 joints, re-settled, no explosion; `verify.mjs`
+  collapse unchanged; all 27 GUI params defined; build clean.
+- **Finding — "the cut did nothing on screen".** It actually worked (severed a joint, woke
+  ~57 pieces) but the pile is contact-supported so pieces only shift ~15 mm → imperceptible.
+  A concrete-only cut (rebar hinge left) is inherently subtle. Fix: **legibility, not more
+  force** — `sim.cut` now returns the severed-joint world positions; the renderer flashes
+  fading yellow spark markers there and the status reports severed/woken counts (and, on
+  severed=0, tells the user to aim at solid grey concrete). Dramatic *movement* (a piece
+  dropping into a void) is the job of the future **rebar cutter** that fully frees pieces.
+- **Testing note:** I can't see the browser (snap Firefox single-instance blocks headless
+  screenshots). Options for on-screen verification: user closes Firefox → I screenshot static
+  renders; OR install Playwright (its own browser) to drive clicks + screenshot. Headless
+  Node (`verify-cut.mjs`) covers the physics; the visual/interaction layer needs one of these.
+
+## Iteration 8 — hole-cutting concrete cutter, rebar cutter, and Playwright
+
+Grounded in a real 16″ disc-cutter video the user shared: the tool cuts **straight-line kerfs**
+and you make a **square hole** to open an ingress; the cut-out plug drops into the void.
+
+- **Concrete cutter = guided square-hole tool.** A `TransformControls` square gizmo is placed
+  on a slab; each Apply (hold Enter) advances a ~10 cm kerf around the perimeter. When the
+  square closes, `sim.cutHoleInSlab` swaps that tile's single box collider for a **4-box FRAME**
+  (same rigid body → all its rebar ties stay intact) and spawns the **plug** as a falling piece.
+  `onReshape` callback lets the renderer rebuild the holed tile as a 4-box group. No CSG.
+  - **Finding:** spawn the plug slightly *smaller* than the hole (0.9×) or it wedges in the
+    frame and won't drop. And to *see* it drop, cut a slab that's actually over a void
+    (`verify-hole.mjs` targets a slab above a detected void).
+- **Rebar cutter** (`sim.cut(mode:'rebar')`): a plane gizmo that **fully breaks** every joint
+  crossing it (ties, hinges, steel members) → frees pieces so they drop. Two-tool story:
+  concrete cutter opens holes / cracks concrete; rebar cutter severs to free.
+- **`sim.cut` generalized** to `mode` — 'concrete' cracks rigid concrete into hinges,
+  'rebar' breaks everything crossing the plane. Multi-collider parts now tracked via
+  `part.colliders`; `_removePart` unregisters all of them.
+
+### Playwright — I can finally see/drive the sim headless
+- **Node 18 here, so pin `playwright@1.48`** (1.50+ needs Node 20). Chromium headless WebGL
+  works with `--use-gl=angle --use-angle=swiftshader --enable-unsafe-swiftshader`.
+- A `?test` URL exposes `window.__app` (params, setEquipment, applyEquipment, camera, …) so
+  `shoot.mjs` can: load → wait for freeze → screenshot → select cutter → cut a hole →
+  re-freeze → zoom the camera onto the hole → screenshot. This is the visual-regression path.
+- Verified on-screen: the collapse (rebar grid, black beams, cyan voids) and a real square
+  hole with the plug dropped. Headless: `verify-hole.mjs` + `verify-cut.mjs` both PASS.
+
+## Iteration 9 — intuitive blade cursor + audio (replaced the gizmo)
+
+The TransformControls gizmo was clunky. Replaced with a **disc-cutter blade** you move with
+the mouse (a canvas sprite: circle + teeth + handle, billboarded, `depthTest:false`).
+
+- **Mouse-driven, raycast onto `structureGroup`.** `pointermove` → position the blade at the
+  hit point (offset along the face normal); `hitPart` via `mesh.userData.part`. The concrete
+  cutter's square footprint + kerf lie on the hit surface (oriented by the face normal).
+- **Audio (`src/audio.js`, Web Audio, no assets):** `playContact()` (metallic tick) fires when
+  the blade first touches a solid; `startGrind()/stopGrind()` gate a looping bandpassed-noise
+  grind while cutting. Hardened with try/catch + a `failed` flag so a no-audio/headless env
+  can't break the sim. Needs a user gesture — `ensureAudio()` resumes on first pointerdown.
+- **Interaction:** HOLD left-mouse to grind (concrete = square hole grows ~0.9 m/s of kerf
+  then plug drops; rebar = one-shot sever under the blade). **Right-drag still orbits**
+  (`controls.mouseButtons.LEFT = null` while a tool is active). Enter / Apply button = one-shot.
+- **Gotcha:** the `?test` hook still referenced the deleted `cutTool` → would ReferenceError.
+  When you delete a gizmo, grep the test hook too. Now exposes `blade`, `lastCut()`.
+- Verified visually via Playwright: the blade sprite reads clearly as a disc cutter on the
+  slab; headless tests + build still green.
+
+### Iteration 9b — visual feedback (dev machine is speaker-less)
+Audio is useless without speakers, so feedback is now visual and the trigger is right-click:
+- **Blade rim turns GREEN on contact** (two canvas textures, swapped on engage) instead of a
+  contact tick. Off a surface, rim is grey + sprite dimmed.
+- **Green translucent square marks the hole** to be cut, laid on the slab under the blade
+  (fill + outline, `depthTest:false`).
+- **RIGHT-CLICK cuts** (one-shot: concrete = square hole + plug drop, rebar = sever). Left-drag
+  still orbits (`mouseButtons.RIGHT=null`, `contextmenu` prevented). Dropped the hold-to-grind
+  progressive kerf. Audio calls remain (harmless) for machines that do have speakers.
+- Playwright now tests the real right-click path (`page.mouse.click(x,y,{button:'right'})`);
+  green rim confirmed on-screen.
+
 ## Gotchas / guardrails
 
 - **Black screen = a load-time exception, not a render bug.** Root cause once: `main.js`
