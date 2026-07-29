@@ -29,7 +29,7 @@ export const DEFAULTS = {
   furniturePerFloor: 3,
   colSegments: 3,
   beamSegments: 3,
-  rebarThickness: 0.035,
+  rebarThickness: 0.045,
   // physics
   gravity: 40,
   restitution: 0.38,
@@ -173,11 +173,11 @@ export class RubbleSim {
     const segRebars = () => {
       if (!withRebar) return null;
       const bars = [];
-      for (const [s1, s2] of [[-1, -1], [1, 1]]) {
+      for (const [s1, s2] of [[-1, -1], [1, -1], [1, 1], [-1, 1]]) {
         const d = { hx: th, hy: th, hz: th, x: 0, y: 0, z: 0 };
-        d['h' + axis] = seg / 2 * 1.2;
-        d[crossAxes[0]] = s1 * cross * 0.3;
-        d[crossAxes[1]] = s2 * cross * 0.3;
+        d['h' + axis] = seg / 2 * 1.15;
+        d[crossAxes[0]] = s1 * cross * 0.5;   // corner bars at the surface -> visible cage
+        d[crossAxes[1]] = s2 * cross * 0.5;
         bars.push(d);
       }
       return bars;
@@ -208,8 +208,8 @@ export class RubbleSim {
       for (const cx of lines) for (const cz of lines)
         this._member('column', { x: cx, y: base, z: cz }, { x: cx, y: topY, z: cz }, o.columnSize, o.colSegments, o.densitySteel, true);
       const lo = lines[0], hi = lines[g - 1];
-      for (const z of [lo, hi]) this._member('beam', { x: lo, y: topY, z }, { x: hi, y: topY, z }, o.beamSize, o.beamSegments, o.densitySteel, false);
-      for (const x of [lo, hi]) this._member('beam', { x, y: topY, z: lo }, { x, y: topY, z: hi }, o.beamSize, o.beamSegments, o.densitySteel, false);
+      for (const z of [lo, hi]) this._member('beam', { x: lo, y: topY, z }, { x: hi, y: topY, z }, o.beamSize, o.beamSegments, o.densitySteel, true);
+      for (const x of [lo, hi]) this._member('beam', { x, y: topY, z: lo }, { x, y: topY, z: hi }, o.beamSize, o.beamSegments, o.densitySteel, true);
 
       // floor = grid of concrete tiles tied edge-to-edge by rebar (a coherent panel)
       const slabY = topY + o.beamSize / 2 + st / 2;

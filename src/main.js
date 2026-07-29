@@ -141,13 +141,13 @@ addEventListener('resize', () => {
 // ---------------------------------------------------------------------------
 // Materials per part kind
 // ---------------------------------------------------------------------------
-// Colour code so rescuers can tell materials apart at a glance:
-//   concrete (slabs/columns/fragments) = grey · steel beams = black · rebar = rust orange
+// Everything structural is REINFORced CONCRETE: grey concrete with a rust-red rebar cage.
+//   concrete (slabs/columns/beams/fragments) = grey · rebar = rust-red · furniture = brown
 const MAT = {
-  slab:      new THREE.MeshStandardMaterial({ color: 0x9a9c9f, roughness: 0.95 }),           // concrete
-  column:    new THREE.MeshStandardMaterial({ color: 0x6f7377, roughness: 0.9 }),             // concrete column (dark grey)
-  beam:      new THREE.MeshStandardMaterial({ color: 0x141416, roughness: 0.5, metalness: 0.7 }), // steel beam (black)
-  rebar:     new THREE.MeshStandardMaterial({ color: 0xc0602a, roughness: 0.55, metalness: 0.6 }), // exposed rebar (rust)
+  slab:      new THREE.MeshStandardMaterial({ color: 0x9a9c9f, roughness: 0.95 }),           // concrete slab
+  column:    new THREE.MeshStandardMaterial({ color: 0x929699, roughness: 0.95 }),            // concrete column
+  beam:      new THREE.MeshStandardMaterial({ color: 0x868b90, roughness: 0.95 }),            // concrete beam (RC, not steel)
+  rebar:     new THREE.MeshStandardMaterial({ color: 0xb04a24, roughness: 0.6, metalness: 0.5 }), // rust-red rebar
   furniture: new THREE.MeshStandardMaterial({ color: 0x9c6a3f, roughness: 0.9 }),             // contents
   fragment:  new THREE.MeshStandardMaterial({ color: 0x8a8d90, roughness: 1 }),               // broken concrete
 };

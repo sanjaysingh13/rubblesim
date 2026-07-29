@@ -211,6 +211,18 @@ Second tool, per the real device: cuts the **exposed rebar in a fracture between
   (parallax on tilted slabs), so the automated screenshot showed grey jaws; engagement itself
   is unit-verified (green on the fracture, off at 0.9 m). Interactive hovering works fine.
 
+## Iteration 11 — visible rebar cage on the whole structure
+
+Feedback: "the entire structure should be reinforced concrete with rebars; I can't see any."
+Rebar was only on slab tops; columns/beams had bars buried *inside* the section (offset
+0.3·cross) so invisible, and beams were black steel.
+- Rebar cage bars moved to the **surface corners** (offset 0.5·cross) as a **4-bar cage** per
+  member, thicker (0.045), so columns and beams visibly show rebar running their length.
+- **Beams are now reinforced concrete** too (rebar cage; grey, not black steel).
+- Colours: columns/beams concrete grey, rebar **rust-red** (0xb04a24), slabs grey.
+- Visual-only (rebar descriptors + materials); densities unchanged, so the collapse tuning
+  and all headless tests still hold. Confirmed with a standing-building screenshot (look.mjs).
+
 ## Gotchas / guardrails
 
 - **Black screen = a load-time exception, not a render bug.** Root cause once: `main.js`
