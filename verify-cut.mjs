@@ -57,8 +57,13 @@ console.log(`max piece movement:  ${maxMove.toFixed(3)} m  (equilibrium change)`
 console.log(`max |coord|:         ${maxAbs.toFixed(1)} m  (explosion check)`);
 console.log(`voids: before=${V0}  after=${V1}`);
 
+// The load-bearing assertions are "a rigid seam was actually severed" + "nothing exploded".
+// The movement floor only guards against a total no-op, and it is gravity-dependent: a
+// contact-supported pile rearranges ~7 mm at real g (9.81) where it moved ~15 mm under the old
+// fake g=40, so the bar is 3 mm. Don't read a larger number here as "a better cut" — DEVLOG
+// iter 7/10 both record that a concrete-only cut is inherently subtle.
 const exploded = maxAbs > 60;
-const ok = sim.stats.cuts >= 1 && res.severed > 0 && maxMove > 0.01 && !exploded;
+const ok = sim.stats.cuts >= 1 && res.severed > 0 && maxMove > 0.003 && !exploded;
 console.log(exploded ? '\nFAIL: pieces flung too far after cut.' :
   ok ? '\nPASS: cut severed concrete and the rubble re-settled into a new equilibrium.' :
        '\nFAIL: expected a severing cut that shifts the rubble.');

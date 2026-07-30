@@ -8,13 +8,19 @@
 //     connected; rebar bars remain EMBEDDED and become EXPOSED at cracks (not falling off).
 //   - Columns are reinforced concrete: stiff segment chains that SNAP at overload, with a
 //     rebar cage that stays attached and protrudes from the break.
-//   - Beams are steel members that snap; they get buried under the pancaking slabs.
-//   - Heavy densities, moderate restitution, damping => a building collapse, not bouncy blocks.
+//   - Beams are reinforced concrete too; they snap and get buried under the pancaking slabs.
+//   - Heavy densities, low restitution, damping => a building collapse, not bouncy blocks.
+//
+// UNITS: length m, mass tonnes (Mg), time s  =>  force kN, stress kPa, E in kPa. Gravity is
+// real (9.81); heaviness comes from restitution/damping/mass. Keeping real units is what lets
+// src/structure.js evaluate genuine code checks (tributary load, crush, Euler buckling) in kN.
 //
 // The renderer supplies onAdd/onRemove callbacks to mirror parts as meshes. Each part
 // carries a box `shape` {hx,hy,hz} and a `matKind` so the renderer knows what to draw.
 
 import { makeRng } from './rng.js';
+import { FrameModel, DebrisSupport } from './structure.js';
+import { RescueOps } from './rescue.js';
 
 export const DEFAULTS = {
   seed: 1,
@@ -32,25 +38,52 @@ export const DEFAULTS = {
   rebarThickness: 0.008,   // rebar rod RADIUS (~0.6 in dia) — thin
   rebarSpacing: 0.2,       // slab rebar grid spacing (m) — dense
   rebarFray: 0.05,         // how far cut rod ends protrude ("frayed ends") at holes/edges
-  // physics
-  gravity: 40,
-  restitution: 0.38,
+  // physics — UNITS: length m, mass tonnes (Mg), time s  =>  force kN, stress kPa.
+  // (Real g; the "heavy, non-bouncy" feel comes from restitution/damping/mass, not fake gravity.)
+  gravity: 9.81,
+  restitution: 0.10,       // concrete-on-concrete: dead thud, not a bounce
   friction: 0.9,
-  linearDamping: 0.12,
-  angularDamping: 0.35,
-  densityConcrete: 2.4,
-  densitySteel: 3.1,
+  linearDamping: 0.08,
+  angularDamping: 0.30,
+  densityConcrete: 2.4,    // Mg/m³ — plain concrete
+  densityMember: 2.5,      // Mg/m³ — reinforced concrete (columns/beams: concrete + rebar)
+  densitySteel: 7.85,      // Mg/m³ — steel (rebar area in the capacity checks)
   substeps: 3,
   // failure
-  columnsRemoved: 0.4,     // fraction of columns removed at collapse
-  contactEventThreshold: 20,
-  beamSnapForce: 3500,     // hard impact that snaps a member joint
-  beamSnapAngle: 0.035,    // bend angle (rad) that snaps a member joint
-  slabCrackForce: 2800,    // hard impact cracks one concrete seam -> rebar hinge (sparse cracks = large pieces)
-  slabTearAngle: 0.7,      // extreme fold where the REBAR itself tears (rare, full separation)
+  // Impact triggers are a NUMERICAL PROXY, not a code check: a rigid-body solver's peak contact
+  // force over one dt is far spikier than a sustained flexural load, so these are calibrated off
+  // the measured distribution (`node measure.mjs`) to reproduce SPARSE cracking — the top ~0.5%
+  // of impacts. The dimensionally-meaningful capacity checks (cracking moment, crush, Euler
+  // buckling) act on static tributary loads in src/structure.js.
+  contactEventThreshold: 10,   // kN — below this is solver noise (p50 ≈ 1.5–4 kN)
+  beamSnapForce: 1150,     // kN impact that snaps a member joint (≈5× p99 of member contacts)
+  // Rigid-body members barely bend (measured max 0.9° at real g — see DEVLOG iter 4), so this is
+  // a near-inert backstop for extreme kinks, NOT the main member-failure path. Real member
+  // failure is beamSnapForce plus the axial crush/buckling check in src/structure.js.
+  beamSnapAngle: 0.012,    // bend angle (rad) that snaps a member joint
+  slabCrackForce: 1400,    // kN impact cracks one concrete seam -> rebar hinge (sparse = large pieces)
+  slabTearAngle: 0.9,      // fold where the REBAR itself tears — p99.9 of measured hinge folds,
+                           // so full separation stays RARE and panels remain coherent
   maxBreaksPerMember: 1,   // members snap into at most 2 pieces (never shatter)
   wakeRadius: 3.0,         // radius of pieces re-woken to re-settle after an equipment cut
   maxParts: 2500,
+  // ---- structural evaluation (src/structure.js) — real code-level values ----
+  concreteE: 25e6,         // kPa (25 GPa) — Young's modulus, normal-weight concrete
+  concreteFc: 25e3,        // kPa (25 MPa) — characteristic cylinder strength f'c
+  steelFy: 415e3,          // kPa (415 MPa) — rebar yield strength
+  deadLoadSuper: 1.5,      // kPa — superimposed dead load (finishes, partitions, services)
+  liveLoadFloor: 2.0,      // kPa — occupancy live load
+  rescuerLoad: 1.2,        // kN — one rescuer + kit as a point live load
+  // The stylized geometry (0.4 m columns on a 2 m grid) is ~20x over-designed for 4 storeys, so
+  // raw geometric capacity would make buckling unreachable. Capacity is therefore sized to
+  // designSafetyFactor x intact service demand, which is how real frames are proportioned.
+  // Set 0 to use the raw geometric section instead.
+  designSafetyFactor: 1.8,
+  endFixityIntact: 0.5,    // Euler K — both ends restrained by floor framing
+  endFixityPinned: 1.0,    // Euler K — framing at one end cracked/severed
+  endFixityFree: 2.0,      // Euler K — top unrestrained (slab above gone) = cantilever
+  failureProfile: 'softStory',  // 'softStory' | 'pancake' | 'progressive'
+  spallOnCut: 0.35,        // fraction of a column's section lost when a tool cuts into it
   // void detection
   voidGrid: 9,
   minVoidHeight: 0.9,      // only clearly survivable pockets
@@ -63,7 +96,7 @@ const qMul = (a, b) => ({
   y: a.w * b.y - a.x * b.z + a.y * b.w + a.z * b.x,
   z: a.w * b.z + a.x * b.y - a.y * b.x + a.z * b.w,
 });
-const relAngle = (qa, qb) => {
+export const relAngle = (qa, qb) => {
   const r = qMul(qConj(qa), qb);
   return 2 * Math.acos(Math.min(1, Math.abs(r.w)));
 };
@@ -85,6 +118,31 @@ const clipRebarForHole = (rebars, cx, cz, rx, rz, fray) => {
       if (hL > z0) out.push({ ...d, z: (z0 + hL) / 2, len: hL - z0 });
       if (z1 > hR) out.push({ ...d, z: (hR + z1) / 2, len: z1 - hR });
     } else out.push(d);
+  }
+  return out;
+};
+
+// Clip a slab's rebar rods against a STRAIGHT cut at `axis = at`, keeping the rods on `side`
+// (-1 = below the cut, +1 = above). Rods running along the cut axis are severed and their cut end
+// protrudes by `fray`; rods running across it are kept whole or dropped depending on which side
+// they sit. `recentre` shifts the survivors into the new body's local frame (0 = same origin).
+const clipRebarForSlice = (rebars, axis, at, side, fray, recentre) => {
+  if (!rebars) return null;
+  const out = [];
+  for (const d of rebars) {
+    if (d.axis === axis) {
+      // rod runs across the cut -> sever it, keeping the piece on `side`, with the cut end
+      // protruding `fray` past the cut line so it reads as frayed rebar
+      const c = d[axis], lo = c - d.len / 2, hi = c + d.len / 2;
+      const start = side < 0 ? lo : Math.max(lo, at - fray);
+      const end = side < 0 ? Math.min(hi, at + fray) : hi;
+      const len = end - start;
+      if (len > 0.02) out.push({ ...d, [axis]: (start + end) / 2 - recentre, len });
+    } else {
+      // rod runs parallel to the cut -> keep it only if it lies on `side`
+      const pos = d[axis];
+      if (side < 0 ? pos <= at : pos >= at) out.push({ ...d, [axis]: pos - recentre });
+    }
   }
   return out;
 };
@@ -124,6 +182,7 @@ export class RubbleSim {
     );
     this.parts = [];
     this.members = [];
+    this.floors = [];        // per storey: {story, tiles[i][j], slabY, tileHalf}
     this.joints = [];        // records: {joint, a, b, type:'member'|'tie', breakAngle, member?, broken}
     this.colliderToPart = new Map();
     this.rng = makeRng(this.opts.seed);
@@ -229,11 +288,16 @@ export class RubbleSim {
 
     for (let s = 0; s < o.stories; s++) {
       const base = s * sh, topY = base + sh;
-      for (const cx of lines) for (const cz of lines)
-        this._member('column', { x: cx, y: base, z: cz }, { x: cx, y: topY, z: cz }, o.columnSize, o.colSegments, o.densitySteel, true);
+      // Columns are tagged with their storey + grid cell so src/structure.js can build the
+      // tributary load path (which column carries which floor area, and what sits above it).
+      for (let i = 0; i < g; i++) for (let j = 0; j < g; j++) {
+        const m = this._member('column', { x: lines[i], y: base, z: lines[j] },
+          { x: lines[i], y: topY, z: lines[j] }, o.columnSize, o.colSegments, o.densityMember, true);
+        m.story = s; m.gi = i; m.gj = j; m.x = lines[i]; m.z = lines[j];
+      }
       const lo = lines[0], hi = lines[g - 1];
-      for (const z of [lo, hi]) this._member('beam', { x: lo, y: topY, z }, { x: hi, y: topY, z }, o.beamSize, o.beamSegments, o.densitySteel, true);
-      for (const x of [lo, hi]) this._member('beam', { x, y: topY, z: lo }, { x, y: topY, z: hi }, o.beamSize, o.beamSegments, o.densitySteel, true);
+      for (const z of [lo, hi]) { const m = this._member('beam', { x: lo, y: topY, z }, { x: hi, y: topY, z }, o.beamSize, o.beamSegments, o.densityMember, true); m.story = s; }
+      for (const x of [lo, hi]) { const m = this._member('beam', { x, y: topY, z: lo }, { x, y: topY, z: hi }, o.beamSize, o.beamSegments, o.densityMember, true); m.story = s; }
 
       // floor = grid of concrete tiles tied edge-to-edge by rebar (a coherent panel)
       const slabY = topY + o.beamSize / 2 + st / 2;
@@ -270,6 +334,10 @@ export class RubbleSim {
         rec.hingeAxis = { x: 0, y: 0, z: 1 };      // crack line runs along z
       }
 
+      // record the floor so the structural model knows what load each storey carries, and so
+      // tools can find the slab above a given column
+      this.floors.push({ story: s, tiles, slabY, tileHalf });
+
       for (let f = 0; f < o.furniturePerFloor; f++) {
         const fw = this.rng.float(0.35, 0.6), fh = this.rng.float(0.4, 0.9), fd = this.rng.float(0.35, 0.6);
         this._addBox({ hx: fw, hy: fh, hz: fd },
@@ -277,21 +345,78 @@ export class RubbleSim {
           null, 'furniture', { fixed: true, density: o.densityConcrete });
       }
     }
+    // structural evaluation layer over the finished frame (specs.md §2)
+    this.frame = new FrameModel(this);
+    this.frame.build();
+    this.support = new DebrisSupport(this);
+    this.rescue = new RescueOps(this);
+
     this.phase = 'standing';
     return this.parts.length;
   }
 
+  /**
+   * Initiate the collapse via a real failure mechanism (specs.md §2A) rather than deleting
+   * columns at random. Each profile applies an INITIATING DAMAGE, then the structural model
+   * decides what actually fails: over-utilised columns are found by capacity check, their load
+   * redistributes to neighbours, and the cascade repeats. So which columns go, and in what
+   * order, is an outcome of the load path — not a coin flip.
+   *
+   *   softStory   — ground-storey columns are gutted (vehicle impact / blast / weak first floor);
+   *                 they buckle under the whole upper-tier weight.
+   *   pancake     — an interior column line is lost mid-height, so floors lose support and stack.
+   *   progressive — ONE column is destroyed; everything after that is pure redistribution, which
+   *                 may or may not take the building down.
+   */
   collapse() {
     if (this.phase === 'collapsing' || this.phase === 'frozen') return;
-    const R = this.R, o = this.opts, sh = o.storyHeight;
-    for (const m of this.members) {
-      if (m.kind !== 'column') continue;
-      const lowY = Math.min(...m.segments.map((s) => s.body.translation().y));
-      if (lowY < sh * 0.9 || this.rng.float(0, 1) < o.columnsRemoved) { for (const s of m.segments) this._removePart(s); m.removed = true; }
+    const R = this.R, o = this.opts, frame = this.frame;
+    const profile = o.failureProfile || 'softStory';
+    this.collapseReport = { profile, initiators: [], cascade: 0 };
+
+    if (frame) {
+      const mid = Math.max(0, Math.min(o.stories - 1, Math.floor(o.stories / 2)));
+      const initiate = (nodes, spall, fixity) => {
+        for (const c of nodes) {
+          frame.damageColumn(c, spall);
+          if (fixity) frame.degradeFixity(c, fixity);
+          this.collapseReport.initiators.push(`storey ${c.story} col (${c.gi},${c.gj})`);
+        }
+      };
+      if (profile === 'softStory') {
+        // gut the ground storey: heavy section loss + the top framing gone (K -> free) so the
+        // Euler capacity of the remaining stubs collapses quadratically
+        initiate(frame.columnsOfStory(0), 0.92, 'free');
+      } else if (profile === 'pancake') {
+        // A pancake needs vertical support lost across a whole LEVEL, so the floor above drops
+        // flat onto the floor below and they stack. Gutting only the interior columns is not
+        // enough (on a 3x3 grid that is a single column, which barely moves anything).
+        initiate(frame.columnsOfStory(mid), 0.95, 'free');
+      } else {
+        // a single destroyed column; the cascade is entirely load redistribution
+        const one = frame.columnsOfStory(0)[0];
+        if (one) initiate([one], 0.98, 'free');
+      }
+
+      // Cascade: capacity checks decide the rest. Every column the model fails is physically
+      // removed, which is what actually drops the loads above it.
+      const failures = frame.evaluate();
+      this.collapseReport.cascade = failures.length;
+      this.collapseReport.log = frame.log.slice(-24);
+      for (const c of failures) {
+        if (c.member.removed) continue;
+        for (const s of c.member.segments) this._removePart(s);
+        c.member.removed = true;
+      }
+      // Columns the model kept but which now carry no floor above (orphaned storeys) are still
+      // standing; leave them — a partially standing frame over a rubble pile is the realistic
+      // and more interesting outcome for void formation.
+      this.collapseReport.standing = frame.report().standing;
     }
+
     for (const p of [...this.parts]) {
       if (p.dead) continue;
-      p.body.setBodyType(R.RigidBodyType.Dynamic, true); p.fixed = false;
+      p.body.setBodyType(R.RigidBodyType.Dynamic, true); p.body.wakeUp(); p.fixed = false;
       p.body.setLinvel({ x: this.rng.float(-0.5, 0.5), y: 0, z: this.rng.float(-0.5, 0.5) }, true);
     }
     this.phase = 'collapsing';
@@ -308,8 +433,15 @@ export class RubbleSim {
 
   step() {
     if (this.phase !== 'collapsing') return;
-    for (let i = 0; i < this.opts.substeps; i++) { this.world.step(this.events); this._processContacts(); }
+    for (let i = 0; i < this.opts.substeps; i++) {
+      // Rapier clears the force accumulator on every step, so lifting-bag forces must be
+      // re-applied per SUBSTEP — doing it once per frame would apply only 1/substeps of the lift.
+      if (this.rescue) this.rescue.applyForces();
+      this.world.step(this.events);
+      this._processContacts();
+    }
     this._processSnaps();
+    if (this.rescue) this.rescue.postStep();
   }
 
   _processContacts() {
@@ -361,15 +493,35 @@ export class RubbleSim {
     else this.stats.tears++;
   }
 
-  freeze() {
+  /**
+   * Settle the pile.
+   *
+   * By default this is a SOFT freeze: bodies stay Dynamic and are put to SLEEP. Sleeping bodies
+   * cost almost nothing to simulate but keep their contact manifolds and normal impulses alive,
+   * so the settled rubble still has real load paths that DebrisSupport / the stress map / lifting
+   * bags / shoring can read. Converting everything to Fixed — which this used to do — zeroes
+   * every contact force and makes the settled pile kinematically fake: no weight bears on
+   * anything, so "how much is on top of this slab?" has no answer.
+   *
+   * Pass {hard:true} for a genuinely immovable pile.
+   */
+  freeze({ hard = false } = {}) {
     if (this.phase === 'frozen') return;
     const R = this.R;
+    const zero = { x: 0, y: 0, z: 0 };
     for (const p of [...this.parts]) {
       if (p.dead) continue;
-      if (p.body.translation().y < -0.5) this._removePart(p);
-      else p.body.setBodyType(R.RigidBodyType.Fixed, true);
+      if (p.body.translation().y < -0.5) { this._removePart(p); continue; }
+      if (hard) { p.body.setBodyType(R.RigidBodyType.Fixed, true); p.fixed = true; }
+      else {
+        p.body.setLinvel(zero, false);
+        p.body.setAngvel(zero, false);
+        p.body.sleep();
+      }
     }
+    this.hardFrozen = hard;
     this.phase = 'frozen';
+    if (this.support && !hard) this.support.rebuild();
   }
 
   // Plane cut used by equipment. mode 'concrete' cracks rigid CONCRETE joints (slab ties + RC
@@ -420,7 +572,7 @@ export class RubbleSim {
     for (const p of this.parts) {
       if (p.dead) continue;
       if (dist(p.body.translation()) <= wake) {
-        p.body.setBodyType(R.RigidBodyType.Dynamic, true);
+        p.body.setBodyType(R.RigidBodyType.Dynamic, true); p.body.wakeUp();
         p.fixed = false;
         woken++;
       }
@@ -456,11 +608,193 @@ export class RubbleSim {
       if (p.dead) continue;
       const t = p.body.translation();
       if (Math.hypot(t.x - near.x, t.y - near.y, t.z - near.z) <= wake) {
-        p.body.setBodyType(R.RigidBodyType.Dynamic, true); p.fixed = false; woken++;
+        p.body.setBodyType(R.RigidBodyType.Dynamic, true); p.body.wakeUp(); p.fixed = false; woken++;
       }
     }
     this.stats.cuts++; this.phase = 'collapsing';
     return { severed: 1, points: [{ x: near.x, y: near.y, z: near.z }], woken };
+  }
+
+  // ---- momentum-preserving severing (specs.md §3.1.3) ---------------------
+
+  /**
+   * Give a newly spawned fragment the motion it should already have. A point of a rigid body
+   * moves at v + ω × r, so a fragment must inherit the parent's spin AND the linear velocity of
+   * its own centroid — not just the parent's centre-of-mass velocity. Without this, pieces
+   * severed out of falling debris stop dead in mid-air, which reads as obviously fake.
+   */
+  _inheritMomentum(parentBody, childBody, worldPos) {
+    const v = parentBody.linvel(), w = parentBody.angvel(), t = parentBody.translation();
+    const r = { x: worldPos.x - t.x, y: worldPos.y - t.y, z: worldPos.z - t.z };
+    childBody.setLinvel({
+      x: v.x + (w.y * r.z - w.z * r.y),
+      y: v.y + (w.z * r.x - w.x * r.z),
+      z: v.z + (w.x * r.y - w.y * r.x),
+    }, true);
+    childBody.setAngvel({ x: w.x, y: w.y, z: w.z }, true);
+  }
+
+  /** Wake every live part within `radius` of a world point. Returns the count. */
+  _wakeNear(point, radius) {
+    const R = this.R;
+    let woken = 0;
+    for (const p of this.parts) {
+      if (p.dead) continue;
+      // Never wake shoring: a shore that gets converted to a falling body is not shoring. It
+      // stays Fixed until it is overloaded, which is RescueOps.measureShores's call to make.
+      if (p.shore) continue;
+      const t = p.body.translation();
+      if (Math.hypot(t.x - point.x, t.y - point.y, t.z - point.z) <= radius) {
+        p.body.setBodyType(R.RigidBodyType.Dynamic, true); p.body.wakeUp(); p.fixed = false; woken++;
+      }
+    }
+    return woken;
+  }
+
+  /**
+   * Re-point one end of an existing joint onto a different body, preserving the record's state
+   * (a cracked hinge stays a hinge). `delta` is the shift from the old body's origin to the new
+   * one's, in the shared local frame, so the anchor keeps pointing at the same physical seam.
+   */
+  _movePartInJoint(rec, from, to, delta) {
+    const id = { x: 0, y: 0, z: 0, w: 1 };
+    this.world.removeImpulseJoint(rec.joint, true);
+    const shift = (a) => ({ x: a.x - delta.x, y: a.y - delta.y, z: a.z - delta.z });
+    if (rec.a === from) { rec.a = to; rec.anchorA = shift(rec.anchorA); }
+    else { rec.b = to; rec.anchorB = shift(rec.anchorB); }
+    const jd = rec.cracked && rec.hingeAxis
+      ? this.R.JointData.revolute(rec.anchorA, rec.anchorB, rec.hingeAxis)
+      : this.R.JointData.fixed(rec.anchorA, id, rec.anchorB, id);
+    rec.joint = this.world.createImpulseJoint(jd, rec.a.body, rec.b.body, true);
+  }
+
+  /**
+   * Cutting torch / saw — specs.md §3.1.2 verbatim: find the structural joint intersecting the
+   * cut and remove it with `world.removeImpulseJoint`. Unlike the hydraulic pliers (which only
+   * reach rebar ALREADY exposed at a fracture), a torch cuts any joint within reach, including
+   * still-embedded slab ties and member welds. Returns {severed, points, woken}.
+   */
+  cutJointNear(point, reach, { types = ['tie', 'member'] } = {}) {
+    let best = null, bd = reach * reach;
+    for (const rec of this.joints) {
+      if (rec.broken || rec.a.dead || rec.b.dead) continue;
+      if (!types.includes(rec.type)) continue;
+      const pa = rec.a.body.translation(), pb = rec.b.body.translation();
+      const mid = { x: (pa.x + pb.x) / 2, y: (pa.y + pb.y) / 2, z: (pa.z + pb.z) / 2 };
+      const d2 = (mid.x - point.x) ** 2 + (mid.y - point.y) ** 2 + (mid.z - point.z) ** 2;
+      if (d2 <= bd) { bd = d2; best = { rec, ...mid }; }
+    }
+    if (!best) return { severed: 0, points: [], woken: 0 };
+    this._breakJoint(best.rec);
+    const woken = this._wakeNear(best, Math.max(reach * 3, 1.5));
+    this.stats.cuts++;
+    this.phase = 'collapsing';
+    return { severed: 1, points: [{ x: best.x, y: best.y, z: best.z }], woken };
+  }
+
+  /**
+   * Breaching hammer: spall the concrete at a point. Physically this removes section rather than
+   * severing anything, so its real consequence is structural, not visual — a spalled column has
+   * less area AND (because I ∝ A² for a square section) far less buckling capacity, which the
+   * FrameModel picks up on its next evaluation. It also cracks the nearest seam, exposing rebar
+   * for the pliers. Returns {spalled, exposed, part}.
+   */
+  spallAt(point, radius) {
+    let target = null, bd = radius * radius;
+    for (const p of this.parts) {
+      if (p.dead) continue;
+      const t = p.body.translation();
+      const d2 = (t.x - point.x) ** 2 + (t.y - point.y) ** 2 + (t.z - point.z) ** 2;
+      if (d2 <= bd) { bd = d2; target = p; }
+    }
+    if (!target) return { spalled: false, exposed: false, part: null };
+    let spalled = false;
+    if (this.frame && target.member && target.member.kind === 'column') {
+      const node = this.frame.nodeForMember(target.member);
+      if (node) {
+        this.frame.damageColumn(node, this.opts.spallOnCut);
+        this.frame.degradeFixity(node, 'pinned');
+        spalled = true;
+      }
+    }
+    // expose rebar at the nearest intact seam so the crew has something to cut
+    const rec = this.joints.find((r) => r.type === 'tie' && !r.cracked && !r.broken &&
+      !r.a.dead && !r.b.dead && (r.a === target || r.b === target));
+    if (rec) this._crackTie(rec);
+    this._wakeNear(point, this.opts.wakeRadius);
+    this.stats.cuts++;
+    this.phase = 'collapsing';
+    return { spalled, exposed: !!rec, part: target };
+  }
+
+  /**
+   * Slice a slab tile clean through along a local axis, splitting ONE rigid body into TWO
+   * (specs.md §3.1.3, "split the parent rigid body into distinct child bodies, copying over the
+   * existing linearVelocity and angularVelocity").
+   *
+   * The LARGER piece keeps the original body, so its rebar ties survive untouched; the smaller is
+   * spawned as a new body inheriting the parent's momentum. Ties anchored on the spawned side are
+   * re-pointed onto the new body, so the panel keeps the right reinforcement topology instead of
+   * silently dropping a tie. `axis` is 'x' or 'z' and `at` is the cut position in tile-local
+   * coordinates. Returns {kept, spawned} or null if the cut is not feasible.
+   */
+  sliceSlab(slab, axis = 'x', at = 0) {
+    if (!slab || slab.dead || slab.frame) return null;      // already holed: geometry too complex
+    const o = this.opts, s = slab.shape, R = this.R;
+    const half = axis === 'x' ? s.hx : s.hz;
+    const minPiece = 0.08;
+    if (at <= -half + minPiece || at >= half - minPiece) return null;
+
+    const rebars0 = slab.rebars;                            // capture BEFORE clipping the kept side
+    const loLen = at + half, hiLen = half - at;             // extents either side of the cut
+    const keepLow = loLen >= hiLen;                         // keep the larger side on this body
+    const keepLen = keepLow ? loLen : hiLen, dropLen = keepLow ? hiLen : loLen;
+    const keepCentre = keepLow ? at - keepLen / 2 : at + keepLen / 2;
+    const dropCentre = keepLow ? at + dropLen / 2 : at - dropLen / 2;
+
+    // 1. shrink the kept side: same body/origin (ties keep their anchors), offset collider
+    const box = { hx: s.hx, hy: s.hy, hz: s.hz, x: 0, y: 0, z: 0 };
+    if (axis === 'x') { box.hx = keepLen / 2; box.x = keepCentre; } else { box.hz = keepLen / 2; box.z = keepCentre; }
+    for (const c of slab.colliders) { this.colliderToPart.delete(c.handle); this.world.removeCollider(c, true); }
+    slab.colliders = [];
+    const cd = R.ColliderDesc.cuboid(box.hx, box.hy, box.hz).setTranslation(box.x, box.y, box.z)
+      .setRestitution(o.restitution).setFriction(o.friction).setDensity(o.densityConcrete);
+    const kc = this.world.createCollider(cd, slab.body);
+    slab.colliders.push(kc);
+    this.colliderToPart.set(kc.handle, slab);
+    slab.col = kc;
+    slab.frame = [box];                                     // renderer rebuilds from this
+    slab.rebars = clipRebarForSlice(rebars0, axis, at, keepLow ? -1 : 1, o.rebarFray, 0);
+    this.onReshape(slab);
+
+    // 2. spawn the smaller side as its own body at the world position of its centroid
+    const localOff = { x: 0, y: 0, z: 0 }; localOff[axis] = dropCentre;
+    const t = slab.body.translation(), q = slab.body.rotation();
+    const woff = rotateVec(q, localOff);
+    const wpos = { x: t.x + woff.x, y: t.y + woff.y, z: t.z + woff.z };
+    const dropShape = { hx: s.hx, hy: s.hy, hz: s.hz };
+    if (axis === 'x') dropShape.hx = dropLen / 2; else dropShape.hz = dropLen / 2;
+    const spawned = this._addBox(dropShape, wpos, q, 'slab',
+      { fixed: false, density: o.densityConcrete, events: true,
+        rebars: clipRebarForSlice(rebars0, axis, at, keepLow ? 1 : -1, o.rebarFray, dropCentre) });
+    if (!spawned) return { kept: slab, spawned: null };
+    this._inheritMomentum(slab.body, spawned.body, wpos);
+
+    // 3. hand over any tie anchored on the side that just became a separate body
+    const delta = { x: 0, y: 0, z: 0 }; delta[axis] = dropCentre;
+    for (const rec of [...this.joints]) {
+      if (rec.broken || rec.type !== 'tie') continue;
+      const isA = rec.a === slab, isB = rec.b === slab;
+      if (!isA && !isB) continue;
+      const anchor = isA ? rec.anchorA : rec.anchorB;
+      const onDropSide = keepLow ? anchor[axis] > at : anchor[axis] < at;
+      if (onDropSide) this._movePartInJoint(rec, slab, spawned, delta);
+    }
+
+    this.stats.cuts++;
+    this.phase = 'collapsing';
+    this._wakeNear(wpos, o.wakeRadius);
+    return { kept: slab, spawned };
   }
 
   // Concrete cutter: a completed square cut removes a plug from a slab tile, leaving a hole.
@@ -507,15 +841,13 @@ export class RubbleSim {
       { x: t.x + off.x, y: t.y + off.y, z: t.z + off.z }, q, 'fragment',
       { fixed: false, density: o.densityConcrete });
 
-    // wake the local region so the plug and nearby debris re-settle
+    // the plug must leave with the momentum it already had (specs.md §3.1.3) — a plug cut out of
+    // a slab that is itself falling or tilting should keep moving with it
     const wc = { x: t.x + off.x, y: t.y + off.y, z: t.z + off.z };
-    for (const p of this.parts) {
-      if (p.dead || p === slab) continue;
-      const pt = p.body.translation();
-      if (Math.hypot(pt.x - wc.x, pt.y - wc.y, pt.z - wc.z) <= this.opts.wakeRadius) {
-        p.body.setBodyType(R.RigidBodyType.Dynamic, true); p.fixed = false;
-      }
-    }
+    if (plug) this._inheritMomentum(slab.body, plug.body, wc);
+
+    // wake the local region so the plug and nearby debris re-settle
+    this._wakeNear(wc, this.opts.wakeRadius);
     this.stats.cuts++;
     this.phase = 'collapsing';
     return { plug, holeWorld: wc };

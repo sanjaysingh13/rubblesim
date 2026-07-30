@@ -305,29 +305,81 @@ Requires an evergreen browser (Chrome/Edge/Firefox/Safari, ~2021+):
 
 ```
 web/
-├── index.html          # app shell + HUD
+├── index.html          # app shell + HUD + tool ring
 ├── vite.config.js      # base './', esnext target
-├── package.json
-├── verify.mjs          # headless CI smoke test — drives sim.js, no browser
+├── package.json        # npm run dev | build | verify | measure | shoot
+├── measure.mjs         # threshold measurement rig (mode=force | mode=folds)
+├── verify*.mjs         # headless CI tests — drive sim.js, no browser
+├── shoot*.mjs          # Playwright drivers — catch load-time / invisible-geometry bugs
 └── src/
     ├── sim.js          # physics core (framework-agnostic): build → collapse →
-    │                   #   slab fracture + beam/column bend-and-snap → freeze →
-    │                   #   detect internal voids. Shared by main.js and verify.mjs.
-    ├── main.js         # renderer: mirrors each sim part as a three.js mesh + GUI
+    │                   #   crack/snap/tear → settle → detect internal voids.
+    │                   #   Shared by main.js and every verify*.mjs.
+    ├── structure.js    # structural engineering layer: tributary loads, axial crush +
+    │                   #   Euler buckling, progressive redistribution (FrameModel);
+    │                   #   contact-graph load paths through the pile (DebrisSupport)
+    ├── rescue.js       # lifting bags + shoring, and their capacity/stall physics
+    ├── equipment.js    # tool registry = the active-tool enum + raycast pick rules
+    ├── main.js         # renderer: mirrors each sim part as a three.js mesh + GUI + HUD
+    ├── audio.js        # Web Audio contact tick / grind (no assets)
     └── rng.js          # seeded deterministic RNG (mirrors -randomseed)
 ```
+
+### Units
+
+Length **m**, mass **tonnes (Mg)**, time **s** ⇒ force in **kN**, stress and moduli in **kPa**.
+Gravity is real (9.81); the heavy, non-bouncy collapse comes from restitution, damping and mass.
+Keeping real units is what lets the structural layer report loads a rescuer could act on.
 
 ### Collapse model (in `sim.js`)
 
 - **Columns & beams** are stiff linear members (chains of box segments held by fixed
-  joints). They flex slightly under load and **snap** at an overstressed joint into two
-  pieces — they never shatter. (True large-deflection *bending* needs soft-body/FEM, which
-  a rigid-body engine can't do; members are stiff-then-fail, like real RC/steel.)
-- **Slabs** are concrete tiles that **fracture** into fragments on a hard enough impact
-  (contact-force threshold).
-- Heavy densities, near-zero restitution, and damping make it collapse like a building.
+  joints). They barely flex (~0.9° max) and **snap** at an overstressed joint into two
+  pieces — they never shatter. True large-deflection *bending* needs soft-body/FEM, which
+  a rigid-body engine can't do; members are stiff-then-fail, like real RC.
+- **Slabs** are concrete tiles **tied together by rebar** into coherent panels. A hard impact
+  cracks one seam into a rebar **hinge** (pieces fold but stay connected); only an extreme fold
+  tears the rebar through. Sparse cracks ⇒ a few large panels that pancake and lean, not a heap
+  of cubes.
+- Heavy densities, low restitution and damping make it collapse like a building.
 - After settling, **voids are detected** (not placed) by ray-marching vertical lines and
   finding enclosed empty gaps — so they are genuinely inside the rubble.
 
-Failure thresholds (`slabFractureForce`, `beamSnapAngle`, `beamSnapForce`, `gravity`, …)
-are tunable live in the GUI and documented as `DEFAULTS` in `sim.js`.
+Impact thresholds (`slabCrackForce`, `beamSnapForce`, `slabTearAngle`, …) are a deliberately
+calibrated *numerical proxy* — a solver's peak contact force over one dt is far spikier than a
+sustained flexural load. Pick them off a measured distribution with `npm run measure`, never by
+guessing. All are tunable live in the GUI and documented as `DEFAULTS` in `sim.js`.
+
+### Structural model (in `structure.js`)
+
+The code checks that actually decide things are **static** evaluations, so they live here:
+
+- **Load matrix** — `W = ∫(D_L + L_L) dA` per tributary bay. A default 4-storey frame carries
+  6.7 kPa dead + 2.0 kPa live per bay, ≈200 kN on a ground column.
+- **Capacity** — axial crush `0.85 f'c A_g + f_y A_s` alongside Euler buckling
+  `P_cr = π²EI/(KL)²`; the model reports which governs. Spalling shrinks `A` linearly and `I`
+  *quadratically*, so damage collapses buckling capacity fast. Note a 0.4 m × 2.6 m RC column is a
+  **short** column — crush governs until spalling is severe.
+- **Progressive collapse** — a failed column sheds its load onto the **adjacent ring** (load
+  follows the beam lines), then the frame is re-evaluated, and the cascade repeats. At
+  `designSafetyFactor` 1.8 the frame survives losing a column; below ~1.3 it doesn't.
+- **Failure profiles** — `softStory`, `pancake`, `progressive` apply an initiating damage; which
+  columns then fail is an outcome of the load path, not a script.
+
+### Rescue tools
+
+Select with the tool ring or keys **0–7**; right-click to use. Left-drag still orbits.
+
+| Tool | Effect |
+| --- | --- |
+| Concrete cutter | Square hole in a slab; the plug drops, keeping its momentum |
+| Concrete saw | Slices a tile clean through into two bodies (rebar and ties handed over) |
+| Rebar cutter | Hydraulic pliers; snips rebar exposed at a fracture |
+| Cutting torch | Removes any structural joint in reach, including embedded ties |
+| Breaching hammer | Spalls concrete — cuts section, exposes rebar, drops buckling capacity |
+| Lifting bag | 4/10/20 t; **stalls** if the debris outweighs its rating, capped at 50 cm |
+| Shoring | T-shore / lace shore; carries measured load and offloads the column it braces |
+
+The training loop is the real one: an under-rated bag stalls, and the way out is to shore the load
+(or cut weight away) and lift again. Press **S** for the stress map (grey → red), **V** for the
+ground-truth void volumes.

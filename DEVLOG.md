@@ -239,13 +239,140 @@ the opening are split and extended a touch past the rim, so cut ends stick into 
 (frayed). `onReshape` renders the trimmed rebar with the frame. Verified: intact slabs read
 as solid concrete; a cut hole shows rust rebar stubs protruding from its edges.
 
+## Iteration 12 — real engineering units + a structural model (specs.md §2–§4)
+
+The passive collapse toy became an interactive tactical trainer. The through-line: **the numbers on
+screen have to be real kN**, or shoring/lifting/buckling decisions are theatre.
+
+### Units: g = 40 → 9.81 (and why the "feel" survived)
+- Adopted **m · tonnes (Mg) · s ⇒ force in kN, stress in kPa**. Densities were already tonnes/m³
+  (2.4), so the old thresholds named "N" were really kN all along — the units were *muddled*, not
+  wrong. `densitySteel: 3.1` was applied to columns/beams that iteration 11 had already made
+  reinforced concrete; now `densityMember: 2.5` with a real `densitySteel: 7.85` kept for rebar area.
+- **Heaviness comes from restitution/damping/mass, not fake gravity.** restitution 0.38 → **0.10**
+  (concrete on concrete is a dead thud). Measured: pile top 3.33 m at rest=0.10 vs **4.70 m** at
+  rest=0.38 — keeping the old restitution at real g reintroduces exactly the "bouncy Lego" scatter
+  iteration 3 fought. Real g alone is not what makes a collapse feel heavy.
+- **Re-tuned thresholds by POSITION IN THE DISTRIBUTION, not by absolute value.** `measure.mjs` now
+  has two modes because one run cannot set both kinds of threshold:
+  - `mode=force` — all triggers off ⇒ true impact-force spectrum ⇒ sets the `*Force` thresholds.
+  - `mode=folds` — cracking ON, tearing off ⇒ how far a cracked rebar hinge actually folds ⇒ the
+    only way to set `slabTearAngle`. In force mode nothing cracks, so there are no hinges, bend
+    stays ~1°, and every angle threshold looks unreachable.
+- **Trap I fell into:** `measure.mjs`'s subclass overrode `_processContacts` to *record* forces and
+  silently dropped the trigger logic. Force mode still looked fine (its thresholds were 1e12
+  anyway) but folds mode reported "cracks formed: 0". A measurement rig that disables the thing it
+  is measuring is worse than no rig. It now records *and* applies, with 1e12 doing the disabling.
+- Result, seeds 1–3: cracks 10–17, tears 0–1, snaps 8–10, settled 144–153, pile 3.8–4.0 m — inside
+  the envelope iteration 6 documented. `slabTearAngle` 0.7 → **0.9** (p99.9 of measured folds; my
+  first guess of 0.35 sat at ~p70 and produced 15 tears instead of 1–3).
+- **`beamSnapAngle` is now a near-inert backstop.** Members bend at most **0.9°** at real g. Any
+  angle threshold that fires reliably would fire on solver noise. Real member failure is
+  `beamSnapForce` plus the axial checks below — as iteration 4 suspected, bend was never the story.
+- Impact triggers are now documented as a **numerical proxy**: a solver's peak contact force over
+  one dt is far spikier than a sustained flexural load. The dimensionally honest checks live in
+  `structure.js` and act on static tributary loads.
+
+### `src/structure.js` — FrameModel (§2)
+- `loadMatrix()` is the discrete form of `W = ∫(D_L + L_L) dA`. Outputs are sane on inspection:
+  **6.7 kPa dead + 2.0 kPa live per bay, 199.8 kN on a ground column of a 4-storey frame.**
+- **The stylized geometry is ~20× over-designed.** 0.4 m columns on a 2 m grid give a raw
+  geometric capacity of ~3700 kN against ~200 kN of demand (utilization 0.05), so buckling is
+  unreachable and nothing ever cascades. Capacity is therefore sized to
+  `designSafetyFactor × intact service demand` (default 1.8), which is how real frames are
+  proportioned; intact worst utilization comes out at **0.556 = 1/1.8**. Set it to 0 for the raw
+  section. The *loads* stay honest; only the capacity is calibrated.
+- **A 0.4 m × 2.6 m RC column is a SHORT column** (slenderness ≈ 45): crush governs, and Euler
+  never bites until spalling is severe. That is not a bug — Euler governs steel and slender
+  concrete. Both checks are implemented, and the model reports which one governs. Because a square
+  section that spalls stays square, `A = A₀·s` and `I = A₀²s²/12` — so section loss collapses
+  buckling capacity *quadratically*, which is exactly the spec's "damaged inertia moment".
+- **Progressive collapse must concentrate load, not spread it.** Shedding a lost column's load over
+  every survivor by inverse-square distance dilutes it so far that a cascade can never start. Load
+  follows the **beam lines**, so it spreads over the adjacent ring only (≤1.5 bays). With that fix:
+  at SF 1.8 losing one column is survived (1 failure, no cascade — real progressive-collapse
+  resistance); at SF 1.15 the same single loss cascades to **9 failures**. The cascade is an
+  outcome of redistribution, not a script.
+- Failure profiles replace the old unconditional ground-floor wipe + 40% coin flip. `pancake` must
+  gut a whole **level** — on a 3×3 grid "interior columns" is a single column, which barely moves.
+
+### The settled pile was kinematically fake
+- `freeze()` set every body to `Fixed`, which **zeroes every contact force**. Nothing bore on
+  anything, so "how much weight is on this slab?" had no answer — and the stress map, lifting bags
+  and shoring all need one. Now a **soft freeze**: bodies stay Dynamic and are put to *sleep*
+  (cheap, and manifolds + normal impulses survive). Verified: 177/177 asleep, 145 support edges,
+  113 parts with a nonzero measured contact load, total pile weight **150 t** for a 4-storey frame.
+- `DebrisSupport.contactForceThrough()` is deliberately **not** the same quantity as
+  `supportedLoad()`. Summing every contact on a wedged slab counts reaction pairs and penetration
+  spikes and legitimately exceeded the whole pile's weight (2153 kN vs 1473 kN total). It is a
+  relative "how squeezed is this" indicator (it drives the stress map). Anything that needs a real
+  load — bag stall, shore sizing — uses the mass-derived `supportedLoad`.
+
+### Lifting bags (§3.2) — a force source cannot hold a load
+- First implementation followed the spec literally (capacity-clamped upward force) and **flung a
+  slab 17 km**. Once the debris is raised, any force above its true weight keeps accelerating it,
+  and the true weight of a contact-supported pile isn't knowable in advance.
+- Second attempt inflated a collider via `setHalfExtents`. Also wrong: a resized shape has **no
+  contact velocity**, so contacts are missed and then resolved as one deep overlap (|coord| ~1e6 m),
+  and the measured load read 0 kN.
+- What works is the spec's *other* sanctioned mechanism ("a temporary constraint"): a constant-size
+  **kinematic platform that rises** via `setNextKinematicTranslation`. The solver gets a proper
+  contact velocity, the debris is carried up smoothly, and the 50 cm cap is **exact geometry**
+  rather than a servo target — which is what "cap rigidly at 50 cm" should mean. Force is still
+  used where a force is right: the reaction into the bag's base, via `addForceAtPoint`.
+- **Interface detection must be a RAY, not a proximity search.** Picking the nearest body by centre
+  distance returned slabs up to 1.15 m off to the side; the bag rose past them and lifted nothing
+  (measured load 0 kN). Verified end state: a 4 t bag under 92 kN of debris measures 60 kN of
+  reaction and lifts **0.000 m**; a 20 t bag lifts the full 0.500 m. The stall is physical.
+
+### Shoring (§3.3)
+- **Shoring's real mechanism is OFFLOADING, not bracing.** Bracing changes `L` and `K`, which only
+  helps if buckling governs — and it usually doesn't (see short columns above). A shore carries
+  load the column no longer has to: `relief` cuts a ground column from 200 kN → 80 kN
+  (utilization 0.56 → 0.22). Bracing is implemented too and does show up on a spalled column
+  (20 → 32 kN, governing flipping buckling → crush).
+- **A shore spawned overlapping debris is not a shore.** A 0.3 m stub jammed into a slab measured
+  617 kN — 3× its own capacity — and "failed" instantly. Placement now ray-casts the clear height,
+  refuses anything under 0.4 m, and seats the head with a **3 mm preload**: a shore built 20 mm
+  short touches nothing and dutifully reports 0 kN forever. Real shores are wedged tight.
+- Load readings are bounded by the weight actually available above, then smoothed (EMA), with a
+  grace period — a shore is judged by where it settles, not by the take-up transient.
+- **Placing a shore must wake the member it is seated under**, or the soffit stays asleep metres
+  overhead and never notices the new support (0 kN forever, again).
+- Timber capacity uses the same Euler/crush pair as the frame: a 0.1 m post is crush-governed at
+  1.5 m (200 kN) and buckling-governed at 2.5 m (132 kN). End to end, shoring drops what a bag is
+  fighting from **144 kN → 67 kN**.
+
+### UI (§4)
+- **three.js layers gate RENDERING as well as raycasting**, and a camera renders only layer 0 by
+  default. Putting rebar on layer 1 and void volumes on layer 2 (so tools can filter what they
+  pick) silently made **both invisible** — the rebar cage vanished from the scene and I nearly
+  shipped it. `camera.layers.enable(1); camera.layers.enable(2)`.
+- Stress map swaps meshes between a bank of 12 pre-built grey→red bucket materials instead of
+  cloning a material per part or rewriting vertex colours every frame. Sampled every N frames
+  because rebuilding the support graph walks every manifold in the pile.
+- Voids are transparent boxes (opacity 0.3) per spec, **plus** `depthTest:false` edges: a void is
+  buried by definition, so a depth-tested fill alone is invisible from outside the pile.
+- **Rapier 0.14 exposes no joint-force readback**, so §4A's "query Rapier joint forces" is served by
+  contact impulses plus the analytic model. Two other spec APIs don't exist as written:
+  `applyForceAtPoint` is `addForceAtPoint(force, WORLD point, wakeUp)`, and `world.contactsWith` is
+  `contactPairsWith(collider)` + `contactPair(a, b, m => m.contactImpulse(i))`.
+- lil-gui sidebar is ~245 px wide; anything positioned on the right is hidden behind it. All
+  readouts moved to the left column.
+
 ## Gotchas / guardrails
 
 - **Black screen = a load-time exception, not a render bug.** Root cause once: `main.js`
   had a `gui.add(params, 'slabFractureForce')` for a param removed from `sim.js` DEFAULTS;
   **lil-gui throws on an undefined property**, killing the module before the render loop.
-  Guardrail: after any DEFAULTS change, run the assertion that every `gui.add`-bound param
-  exists in the assembled `params` object.
+  Guardrail: this is now an automated test — **`node verify-params.mjs`** parses every
+  `X.add(params, '…')` in main.js and asserts it resolves. Run it after any DEFAULTS change.
+  (It earned its keep immediately: iteration 12 removed the now-unused `columnsRemoved`.)
+- **`npm run verify`** runs the whole headless suite; **`npm run measure`** is the threshold rig;
+  **`npm run shoot`** drives the browser (needs `npm run dev` in another shell).
+- **A `vite build` passing does not mean the page runs.** Only the Playwright drivers
+  (`shoot.mjs`, `shoot-ui.mjs`) catch load-time exceptions and invisible-geometry bugs; both fail
+  the run on any `pageerror`.
 - **HMR does not recover from a module-load exception** — hard-reload (Ctrl+Shift+R) after
   fixing such a crash.
 - **Rapier 0.14 (compat) API used:** `World`, `RigidBodyDesc.fixed/dynamic` +

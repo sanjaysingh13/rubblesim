@@ -17,9 +17,43 @@
       }
       #hud b { color: #4fd6ff; }
       #hud .k { color: #9fb0c0; }
-      #status { position: fixed; right: 12px; top: 12px; z-index: 10;
+      /* Left column: hud, then status, then the load readout. The right side belongs to lil-gui,
+         which is ~245px wide — anything placed there is simply hidden behind it. */
+      #status { position: fixed; left: 12px; top: 208px; z-index: 10; max-width: 320px;
         color: #4fd6ff; font-size: 12px; background: rgba(14,17,22,.72);
         border: 1px solid #222a33; border-radius: 8px; padding: 6px 10px; }
+      /* Tool ring (specs.md §4B): the active tool is global state, shown as a selectable ring. */
+      #toolring {
+        position: fixed; left: 50%; bottom: 16px; transform: translateX(-50%); z-index: 20;
+        display: flex; gap: 6px; padding: 7px 9px;
+        background: rgba(14,17,22,.85); border: 1px solid #222a33; border-radius: 999px;
+      }
+      #toolring button {
+        display: flex; flex-direction: column; align-items: center; gap: 2px;
+        min-width: 62px; padding: 6px 8px; cursor: pointer;
+        background: #171c22; color: #aab6c2; font: inherit; font-size: 10px;
+        border: 1px solid #2a323b; border-radius: 10px; line-height: 1.25;
+      }
+      #toolring button .ic { font-size: 15px; }
+      #toolring button .kb { color: #5d6b7a; font-size: 9px; }
+      #toolring button:hover { background: #1e252d; color: #dce6f0; }
+      #toolring button[aria-pressed="true"] {
+        background: #123a2a; border-color: #33ff88; color: #b6ffd6;
+      }
+      #toolring button[aria-pressed="true"] .kb { color: #6fe0aa; }
+      /* Load readout: live engineering numbers for the active bags/shores. */
+      #loads {
+        position: fixed; left: 12px; top: 268px; z-index: 10; width: 320px;
+        color: #cdd6e0; font-size: 11px; line-height: 1.5; font-variant-numeric: tabular-nums;
+        background: rgba(14,17,22,.78); border: 1px solid #222a33;
+        border-radius: 8px; padding: 8px 10px; pointer-events: none;
+      }
+      #loads h4 { color: #4fd6ff; font-size: 11px; font-weight: 600; margin-bottom: 3px; }
+      #loads .row { display: flex; justify-content: space-between; gap: 10px; }
+      #loads .warn { color: #ffb347; }
+      #loads .bad { color: #ff5c6c; }
+      #loads .ok { color: #6fe0aa; }
+      #loads .muted { color: #7f8b98; }
     </style>
   </head>
   <body>
@@ -30,10 +64,14 @@
       <hr style="border-color:#222a33;margin:6px 0" />
       <div><span class="k">Drag</span> orbit &nbsp; <span class="k">Scroll</span> zoom</div>
       <div><span class="k">P</span> regenerate &nbsp; <span class="k">F</span> freeze now</div>
-      <div><span class="k">V</span> toggle void markers</div>
-      <div>Cyan wireframes = ground-truth voids</div>
+      <div><span class="k">V</span> voids &nbsp; <span class="k">S</span> stress map &nbsp; <span class="k">0-7</span> tool</div>
+      <div><span class="k">Right-click</span> use tool &nbsp; <span class="k">Left-drag</span> orbit</div>
+      <div>Cyan boxes = ground-truth voids</div>
+      <div>Grey→red = stress / utilization</div>
     </div>
     <div id="status">booting…</div>
+    <div id="loads"></div>
+    <div id="toolring"></div>
     <script type="module" src="/src/main.js"></script>
   </body>
 </html>
