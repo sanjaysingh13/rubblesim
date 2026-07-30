@@ -213,6 +213,8 @@ function onReshape(part) {
     box.position.set(b.x, b.y, b.z); box.castShadow = true; box.receiveShadow = true;
     g.add(box);
   }
+  const rb = buildRebarMesh(part.rebars);   // trimmed rebar — frayed ends stick into the hole
+  if (rb) g.add(rb);
   const t = part.body.translation(), r = part.body.rotation();
   g.position.set(t.x, t.y, t.z); g.quaternion.set(r.x, r.y, r.z, r.w);
   g.userData.part = part; part.mesh = g;

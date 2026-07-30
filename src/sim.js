@@ -29,8 +29,9 @@ export const DEFAULTS = {
   furniturePerFloor: 3,
   colSegments: 3,
   beamSegments: 3,
-  rebarThickness: 0.015,   // rebar rod RADIUS (~1.2 in dia)
-  rebarSpacing: 0.32,      // slab rebar grid spacing (m)
+  rebarThickness: 0.008,   // rebar rod RADIUS (~0.6 in dia) — thin
+  rebarSpacing: 0.2,       // slab rebar grid spacing (m) — dense
+  rebarFray: 0.05,         // how far cut rod ends protrude ("frayed ends") at holes/edges
   // physics
   gravity: 40,
   restitution: 0.38,
@@ -66,6 +67,28 @@ const relAngle = (qa, qb) => {
   const r = qMul(qConj(qa), qb);
   return 2 * Math.acos(Math.min(1, Math.abs(r.w)));
 };
+// Clip a slab's rebar rods against a rectangular hole (tile-local). Rods that cross the hole
+// are split into pieces that stop at the hole edge, extended by `fray` so the cut ends stick
+// slightly into the opening (frayed rebar). Rods that miss the hole pass through unchanged.
+const clipRebarForHole = (rebars, cx, cz, rx, rz, fray) => {
+  if (!rebars) return null;
+  const out = [];
+  for (const d of rebars) {
+    if (d.axis === 'x') {
+      if (Math.abs(d.z - cz) > rz) { out.push(d); continue; }
+      const x0 = d.x - d.len / 2, x1 = d.x + d.len / 2, hL = cx - rx + fray, hR = cx + rx - fray;
+      if (hL > x0) out.push({ ...d, x: (x0 + hL) / 2, len: hL - x0 });
+      if (x1 > hR) out.push({ ...d, x: (hR + x1) / 2, len: x1 - hR });
+    } else if (d.axis === 'z') {
+      if (Math.abs(d.x - cx) > rx) { out.push(d); continue; }
+      const z0 = d.z - d.len / 2, z1 = d.z + d.len / 2, hL = cz - rz + fray, hR = cz + rz - fray;
+      if (hL > z0) out.push({ ...d, z: (z0 + hL) / 2, len: hL - z0 });
+      if (z1 > hR) out.push({ ...d, z: (hR + z1) / 2, len: z1 - hR });
+    } else out.push(d);
+  }
+  return out;
+};
+
 // rotate a vector by a unit quaternion
 const rotateVec = (q, v) => {
   const tx = 2 * (q.y * v.z - q.z * v.y), ty = 2 * (q.z * v.x - q.x * v.z), tz = 2 * (q.x * v.y - q.y * v.x);
@@ -218,14 +241,16 @@ export class RubbleSim {
       for (let i = 0; i < g; i++) {
         tiles[i] = [];
         for (let j = 0; j < g; j++) {
-          // reinforcement mesh: a grid of thin cylindrical rods near the slab's top face.
+          // reinforcement skeleton: a dense grid of thin cylindrical rods EMBEDDED at the
+          // slab's mid-plane (hidden in intact concrete; exposed as frayed ends at breaks/cuts).
+          // Rods run slightly past the tile so their ends protrude at fractures/edges.
           const tileRebars = [];
           const n = Math.max(2, Math.round((tileHalf * 2) / o.rebarSpacing));
-          const ry = st / 2;                     // near the top surface (exposed when concrete spalls)
+          const len = tileHalf * 2 + 2 * o.rebarFray;
           for (let k = 0; k <= n; k++) {
             const u = -tileHalf + (tileHalf * 2) * (k / n);
-            tileRebars.push({ x: 0, y: ry, z: u, len: tileHalf * 2, r: th, axis: 'x' });
-            tileRebars.push({ x: u, y: ry, z: 0, len: tileHalf * 2, r: th, axis: 'z' });
+            tileRebars.push({ x: 0, y: 0, z: u, len, r: th, axis: 'x' });
+            tileRebars.push({ x: u, y: 0, z: 0, len, r: th, axis: 'z' });
           }
           tiles[i][j] = this._addBox({ hx: tileHalf, hy: st / 2, hz: tileHalf },
             { x: lines[i], y: slabY, z: lines[j] }, null, 'slab',
@@ -470,7 +495,8 @@ export class RubbleSim {
     }
     slab.col = slab.colliders[0] || null;
     slab.frame = frame;                                    // renderer rebuilds mesh from this
-    slab.rebars = null;
+    // keep the rebar but trim it to the hole -> frayed ends stick into the opening
+    slab.rebars = clipRebarForHole(slab.rebars, holeCx, holeCz, rx, rz, this.opts.rebarFray);
     this.onReshape(slab);
 
     // spawn the plug at the hole location (tile local -> world), a touch smaller than the hole

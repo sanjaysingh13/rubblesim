@@ -47,13 +47,14 @@ console.log(`cuts=${b.cuts}  parts=${stats.parts}  distance between the two hole
 console.log(dist > 0.4 ? 'OK: the two aimed cuts landed at different spots (not a fixed random fallback).'
                        : 'WARN: the two cuts landed at ~the same spot — check aiming.');
 
-// hide the void markers so the hole is visible, then zoom the camera onto it
+// hide void markers + the tool blade, then look down INTO the hole (frayed rebar at the rim)
 await page.keyboard.press('v');
+await page.evaluate(() => { window.__app.params.equipment = 'None'; window.__app.setEquipment('None'); });
 await page.evaluate(() => {
   const { camera, controls, lastCut } = window.__app;
   const p = lastCut();
-  camera.position.set(p.x + 2.2, p.y + 1.8, p.z + 2.2);
-  controls.target.set(p.x, p.y - 0.3, p.z);
+  camera.position.set(p.x + 0.9, p.y + 1.7, p.z + 0.9);
+  controls.target.set(p.x, p.y - 0.2, p.z);
   controls.update();
 });
 await page.waitForTimeout(400);

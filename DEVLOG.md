@@ -230,6 +230,15 @@ My "2 fat boxes per tile" was wrong. Now: each slab carries a **grid of thin cyl
 longitudinal corner rods. Rebar descriptors are now `{x,y,z,len,r,axis}`; the renderer merges
 a part's rods into one cylinder mesh (`mergeGeometries`) to keep draw calls low. Rust-red.
 
+### 11c — rebar as an embedded skeleton with frayed ends
+Rebar now sits at the slab **mid-plane** (embedded, hidden in intact concrete), denser
+(spacing 0.2 m) and thinner (r 0.008 m). Rods run slightly past the tile (`rebarFray`) so
+their ends **protrude at fractures and slab edges**. When the concrete cutter removes a
+square, the rebar is **kept and trimmed to the hole** (`clipRebarForHole`) — rods crossing
+the opening are split and extended a touch past the rim, so cut ends stick into the hole
+(frayed). `onReshape` renders the trimmed rebar with the frame. Verified: intact slabs read
+as solid concrete; a cut hole shows rust rebar stubs protruding from its edges.
+
 ## Gotchas / guardrails
 
 - **Black screen = a load-time exception, not a render bug.** Root cause once: `main.js`
