@@ -195,11 +195,26 @@ const MAT = {
   slab:      new THREE.MeshStandardMaterial({ color: 0x9a9c9f, roughness: 0.95 }),           // concrete slab
   column:    new THREE.MeshStandardMaterial({ color: 0x929699, roughness: 0.95 }),            // concrete column
   beam:      new THREE.MeshStandardMaterial({ color: 0x868b90, roughness: 0.95 }),            // concrete beam (RC, not steel)
-  rebar:     new THREE.MeshStandardMaterial({ color: 0xb04a24, roughness: 0.6, metalness: 0.5 }), // rust-red rebar
+  rebar:     new THREE.MeshStandardMaterial({ color: 0x904428, roughness: 0.7, metalness: 0.35 }), // rust-red — subdued so grey concrete dominates
   furniture: new THREE.MeshStandardMaterial({ color: 0x9c6a3f, roughness: 0.9 }),             // contents
   fragment:  new THREE.MeshStandardMaterial({ color: 0x8a8d90, roughness: 1 }),               // broken concrete
   shore:     new THREE.MeshStandardMaterial({ color: 0xc79a5b, roughness: 0.85 }),            // timber shoring
 };
+
+// Chipped cover concrete — mostly opaque grey; rebar is a hint inside, not a solid red wash.
+const MAT_SKINNED = {
+  slab:     new THREE.MeshStandardMaterial({ color: 0x9a9c9f, roughness: 0.95, transparent: true, opacity: 0.68, depthWrite: true }),
+  column:   new THREE.MeshStandardMaterial({ color: 0x929699, roughness: 0.95, transparent: true, opacity: 0.70, depthWrite: true }),
+  beam:     new THREE.MeshStandardMaterial({ color: 0x868b90, roughness: 0.95, transparent: true, opacity: 0.70, depthWrite: true }),
+  fragment: new THREE.MeshStandardMaterial({ color: 0x8a8d90, roughness: 1, transparent: true, opacity: 0.65, depthWrite: true }),
+};
+
+/** Concrete material for a part: opaque when intact, skinned (translucent) when rebar is exposed. */
+function concreteMat(part) {
+  const kind = part.matKind || part.kind;
+  if (part.rebarExposed && MAT_SKINNED[kind]) return MAT_SKINNED[kind];
+  return MAT[kind] || MAT.fragment;
+}
 
 // --- Stress map (specs.md §4A) -------------------------------------------------------------
 // Lerp grey [0.5,0.5,0.5] -> red [1,0,0] with the stress fraction. Rather than cloning a material
@@ -229,12 +244,13 @@ let phase = 'idle';
 let timer = 0;
 let settleDuration = 8;   // seconds of re-settling before auto-freeze (collapse vs cut)
 
-// merge a part's rebar rod descriptors {x,y,z,len,r,axis} into one thin-cylinder mesh
+// merge a part's rebar rod descriptors {x,y,z,len,r,axis} into one thin-cylinder mesh.
+// axis 'y' needs no rotation (CylinderGeometry already runs along +Y); 'x'/'z' are spun into place.
 function buildRebarMesh(rebars) {
   if (!rebars || !rebars.length) return null;
   const geoms = [];
   for (const d of rebars) {
-    const g = new THREE.CylinderGeometry(d.r, d.r, d.len, 8, 1);   // cylinder is along +Y
+    const g = new THREE.CylinderGeometry(d.r, d.r, d.len, 6, 1);   // 6 segs — denser lattice, keep verts down
     if (d.axis === 'x') g.rotateZ(Math.PI / 2);
     else if (d.axis === 'z') g.rotateX(Math.PI / 2);
     g.translate(d.x, d.y, d.z);
@@ -248,6 +264,22 @@ function buildRebarMesh(rebars) {
   return m;
 }
 
+// Rebar is embedded under intact concrete — keep it hidden until a crack/cut/spall exposes it.
+function attachRebar(parent, part) {
+  const rb = buildRebarMesh(part.rebars);
+  if (!rb) return;
+  rb.visible = !!part.rebarExposed;
+  rb.layers.set(LAYER_REBAR);
+  rb.userData.part = part;
+  rb.userData.isRebar = true;
+  parent.add(rb);
+}
+
+function showRebar(part) {
+  if (!part?.mesh) return;
+  part.mesh.traverse((o) => { if (o.userData?.isRebar) o.visible = true; });
+}
+
 // Raycast layers (specs.md §4B): concrete on layer 0, reinforcement on layer 1, so the active
 // tool can restrict what it is physically able to grab. A torch set to layer 1 simply cannot
 // select a concrete face, which removes the whole class of "I aimed at rebar and cut the slab".
@@ -255,18 +287,17 @@ const LAYER_CONCRETE = 0, LAYER_REBAR = 1, LAYER_VOID = 2;
 
 function onAdd(part) {
   const s = part.shape;
-  const mesh = new THREE.Mesh(new THREE.BoxGeometry(s.hx * 2, s.hy * 2, s.hz * 2), MAT[part.matKind] || MAT.fragment);
+  const mesh = new THREE.Mesh(new THREE.BoxGeometry(s.hx * 2, s.hy * 2, s.hz * 2), concreteMat(part));
   mesh.castShadow = true; mesh.receiveShadow = true;
   mesh.layers.set(LAYER_CONCRETE);
   const t = part.body.translation(), r = part.body.rotation();
   mesh.position.set(t.x, t.y, t.z);
   mesh.quaternion.set(r.x, r.y, r.z, r.w);
-  // reinforcement: thin cylindrical rods (a grid in slabs; corner bars in columns/beams),
+  // reinforcement: thin cylindrical rods (3D lattice in slabs; corner bars in columns/beams),
   // merged into one child mesh that rides with the concrete piece.
-  const rb = buildRebarMesh(part.rebars);
-  if (rb) { rb.layers.set(LAYER_REBAR); rb.userData.part = part; rb.userData.isRebar = true; mesh.add(rb); }
+  attachRebar(mesh, part);
   part.mesh = mesh;
-  part.baseMat = MAT[part.matKind] || MAT.fragment;
+  part.baseMat = concreteMat(part);
   mesh.userData.part = part;   // back-reference for picking
   structureGroup.add(mesh);
 }
@@ -274,21 +305,30 @@ function disposeMesh(obj) { obj.traverse((o) => { if (o.geometry) o.geometry.dis
 function onRemove(part) {
   if (part.mesh) { structureGroup.remove(part.mesh); disposeMesh(part.mesh); part.mesh = null; }
 }
+// Skin the concrete (translucent) so the endo-skeleton reads through — called when a crack,
+// snap, cut, or spall exposes the rebar. No mesh rebuild; just swap materials on concrete faces.
+function onExpose(part) {
+  if (!part.mesh) return;
+  showRebar(part);
+  const mat = concreteMat(part);
+  part.baseMat = mat;
+  paintPart(part, params.showStress ? stressMatFor(stressOf(part)) : mat);
+}
 // after a hole is cut, rebuild the tile's mesh as a group of frame boxes (with the hole)
 function onReshape(part) {
   if (part.mesh) { structureGroup.remove(part.mesh); disposeMesh(part.mesh); }
+  const mat = concreteMat(part);
   const g = new THREE.Group();
   for (const b of part.frame) {
-    const box = new THREE.Mesh(new THREE.BoxGeometry(b.hx * 2, b.hy * 2, b.hz * 2), MAT[part.matKind] || MAT.slab);
+    const box = new THREE.Mesh(new THREE.BoxGeometry(b.hx * 2, b.hy * 2, b.hz * 2), mat);
     box.position.set(b.x, b.y, b.z); box.castShadow = true; box.receiveShadow = true;
     box.layers.set(LAYER_CONCRETE); box.userData.part = part;
     g.add(box);
   }
-  const rb = buildRebarMesh(part.rebars);   // trimmed rebar — frayed ends stick into the hole
-  if (rb) { rb.layers.set(LAYER_REBAR); rb.userData.part = part; rb.userData.isRebar = true; g.add(rb); }
+  attachRebar(g, part);   // trimmed 3D lattice — frayed ends stick into the hole
   const t = part.body.translation(), r = part.body.rotation();
   g.position.set(t.x, t.y, t.z); g.quaternion.set(r.x, r.y, r.z, r.w);
-  g.userData.part = part; part.mesh = g;
+  g.userData.part = part; part.mesh = g; part.baseMat = mat;
   structureGroup.add(g);
 }
 
@@ -368,7 +408,7 @@ function rebuild() {
   for (const [, mesh] of bagMeshes) { structureGroup.remove(mesh); disposeMesh(mesh); }
   bagMeshes.clear();
   compromised = 0; voidEvents.length = 0;
-  sim = new RubbleSim(RAPIER, params, { onAdd, onRemove, onReshape });
+  sim = new RubbleSim(RAPIER, params, { onAdd, onRemove, onReshape, onExpose });
   const n = sim.build();
   phase = 'standing'; timer = 0;
   setStatus(`standing ${params.stories}-story building (${n} pieces) — collapse in ${params.standSeconds}s`);
@@ -763,6 +803,11 @@ fB.add(params, 'stories', 1, 8, 1);
 fB.add(params, 'buildingSize', 3, 12, 0.5);
 fB.add(params, 'grid', 2, 4, 1);
 fB.add(params, 'furniturePerFloor', 0, 8, 1);
+const fR = gui.addFolder('Rebar lattice');
+fR.add(params, 'rebarLayers', 1, 6, 1).name('layers / slab');
+fR.add(params, 'rebarSpacing', 0.05, 0.25, 0.01).name('grid spacing (m)');
+fR.add(params, 'rebarThickness', 0.003, 0.015, 0.001).name('rod radius (m)');
+fR.add(params, 'rebarCover', 0.01, 0.06, 0.005).name('cover (m)');
 const fP = gui.addFolder('Physics');
 fP.add(params, 'gravity', 9.81, 40, 0.5);
 fP.add(params, 'restitution', 0, 0.4, 0.01);

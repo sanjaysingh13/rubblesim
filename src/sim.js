@@ -5,7 +5,9 @@
 //   - Floor slabs are grids of concrete tiles TIED TOGETHER by rebar (fixed joints).
 //     They stay coherent panels that tilt/pancake — creating lean-to voids — rather than
 //     shattering into loose cubes. A tie tears only under extreme bend, so panels stay
-//     connected; rebar bars remain EMBEDDED and become EXPOSED at cracks (not falling off).
+//     connected. Each tile carries a 3D rectangular rebar LATTICE (rebarLayers stacked
+//     X–Z mats + vertical stirrups) as its endo-skeleton; rods stay EMBEDDED under intact
+//     concrete and are REVEALED (skinned / frayed) when the tile cracks, snaps, or is cut.
 //   - Columns are reinforced concrete: stiff segment chains that SNAP at overload, with a
 //     rebar cage that stays attached and protrudes from the break.
 //   - Beams are reinforced concrete too; they snap and get buried under the pancaking slabs.
@@ -35,8 +37,14 @@ export const DEFAULTS = {
   furniturePerFloor: 3,
   colSegments: 3,
   beamSegments: 3,
-  rebarThickness: 0.008,   // rebar rod RADIUS (~0.6 in dia) — thin
-  rebarSpacing: 0.2,       // slab rebar grid spacing (m) — dense
+  // Slab reinforcement is a 3D rectangular lattice (the endo-skeleton of RC): several planar
+  // X–Z grids stacked through the slab thickness, tied by vertical stirrups at each grid node.
+  // Rods are visual-only (ride as child meshes); physics cost is zero. Defaults aim at the
+  // ~1–2 cm bars / ~10–15 cm centres of real light RC floor slabs (see reference skinned photos).
+  rebarThickness: 0.008,   // rod RADIUS (m) — ~16 mm dia (1–2 cm real bars), visible when skinned
+  rebarSpacing: 0.10,      // planar grid spacing (m) — ~10 cm centres, dense RC floor mat
+  rebarLayers: 4,          // stacked planar lattices through the slab thickness (top/bottom mats + inner)
+  rebarCover: 0.022,       // concrete cover (m) — inset of outer layers from the slab faces
   rebarFray: 0.05,         // how far cut rod ends protrude ("frayed ends") at holes/edges
   // physics — UNITS: length m, mass tonnes (Mg), time s  =>  force kN, stress kPa.
   // (Real g; the "heavy, non-bouncy" feel comes from restitution/damping/mass, not fake gravity.)
@@ -103,6 +111,7 @@ export const relAngle = (qa, qb) => {
 // Clip a slab's rebar rods against a rectangular hole (tile-local). Rods that cross the hole
 // are split into pieces that stop at the hole edge, extended by `fray` so the cut ends stick
 // slightly into the opening (frayed rebar). Rods that miss the hole pass through unchanged.
+// Vertical stirrups that sit inside the hole footprint are dropped (they leave with the plug).
 const clipRebarForHole = (rebars, cx, cz, rx, rz, fray) => {
   if (!rebars) return null;
   const out = [];
@@ -117,9 +126,74 @@ const clipRebarForHole = (rebars, cx, cz, rx, rz, fray) => {
       const z0 = d.z - d.len / 2, z1 = d.z + d.len / 2, hL = cz - rz + fray, hR = cz + rz - fray;
       if (hL > z0) out.push({ ...d, z: (z0 + hL) / 2, len: hL - z0 });
       if (z1 > hR) out.push({ ...d, z: (hR + z1) / 2, len: z1 - hR });
+    } else if (d.axis === 'y') {
+      // vertical stirrup: only keep if it sits outside the hole footprint
+      if (Math.abs(d.x - cx) > rx || Math.abs(d.z - cz) > rz) out.push(d);
     } else out.push(d);
   }
   return out;
+};
+
+// Inverse of clipRebarForHole: the rod segments that lived INSIDE the hole, recentred into the
+// plug's local frame (origin at the hole centre). The falling plug carries its piece of the
+// endo-skeleton with it — otherwise a cut-out chunk of RC would look like plain concrete.
+const extractRebarForHole = (rebars, cx, cz, rx, rz) => {
+  if (!rebars) return null;
+  const out = [];
+  for (const d of rebars) {
+    if (d.axis === 'x') {
+      if (Math.abs(d.z - cz) > rz) continue;
+      const x0 = d.x - d.len / 2, x1 = d.x + d.len / 2;
+      const start = Math.max(x0, cx - rx), end = Math.min(x1, cx + rx);
+      const len = end - start;
+      if (len > 0.02) out.push({ ...d, x: (start + end) / 2 - cx, z: d.z - cz, len });
+    } else if (d.axis === 'z') {
+      if (Math.abs(d.x - cx) > rx) continue;
+      const z0 = d.z - d.len / 2, z1 = d.z + d.len / 2;
+      const start = Math.max(z0, cz - rz), end = Math.min(z1, cz + rz);
+      const len = end - start;
+      if (len > 0.02) out.push({ ...d, z: (start + end) / 2 - cz, x: d.x - cx, len });
+    } else if (d.axis === 'y') {
+      if (Math.abs(d.x - cx) <= rx && Math.abs(d.z - cz) <= rz)
+        out.push({ ...d, x: d.x - cx, z: d.z - cz });
+    }
+  }
+  return out.length ? out : null;
+};
+
+// Build the 3D rectangular rebar lattice for one slab tile (tile-local coords).
+// Real reinforced-concrete slabs are NOT a single mid-plane grid — they carry several stacked
+// X–Z mats (typically top + bottom + inner layers) tied together by vertical stirrups at every
+// grid intersection, forming a rectangular endo-skeleton through the slab thickness.
+const buildSlabRebarLattice = (tileHalf, slabThickness, opts) => {
+  const th = opts.rebarThickness;
+  const nLayers = Math.max(1, Math.round(opts.rebarLayers ?? 1));
+  const cover = Math.min(opts.rebarCover ?? 0.025, slabThickness * 0.4);
+  const n = Math.max(2, Math.round((tileHalf * 2) / opts.rebarSpacing));
+  const len = tileHalf * 2 + 2 * opts.rebarFray;
+  const halfH = slabThickness / 2;
+  const yTop = halfH - cover, yBot = -halfH + cover;
+  const bars = [];
+  const lineAt = (k) => -tileHalf + (tileHalf * 2) * (k / n);
+
+  // stacked horizontal mats — each layer is a full X–Z grid at a different depth
+  for (let L = 0; L < nLayers; L++) {
+    const y = nLayers === 1 ? 0 : yBot + (yTop - yBot) * (L / (nLayers - 1));
+    for (let k = 0; k <= n; k++) {
+      const u = lineAt(k);
+      bars.push({ x: 0, y, z: u, len, r: th, axis: 'x' });
+      bars.push({ x: u, y, z: 0, len, r: th, axis: 'z' });
+    }
+  }
+  // vertical stirrups at every grid node — the uprights that turn stacked mats into a 3D cage
+  if (nLayers >= 2) {
+    const vLen = (yTop - yBot) + 2 * th;
+    const vMid = (yTop + yBot) / 2;
+    for (let i = 0; i <= n; i++) for (let j = 0; j <= n; j++) {
+      bars.push({ x: lineAt(i), y: vMid, z: lineAt(j), len: vLen, r: th, axis: 'y' });
+    }
+  }
+  return bars;
 };
 
 // Clip a slab's rebar rods against a STRAIGHT cut at `axis = at`, keeping the rods on `side`
@@ -164,6 +238,7 @@ export class RubbleSim {
     this.onAdd = callbacks.onAdd || (() => {});
     this.onRemove = callbacks.onRemove || (() => {});
     this.onReshape = callbacks.onReshape || (() => {}); // renderer rebuilds a part's mesh after a hole is cut
+    this.onExpose = callbacks.onExpose || (() => {});   // renderer skins concrete when rebar is revealed
     this.phase = 'idle';
     this._init();
   }
@@ -226,6 +301,15 @@ export class RubbleSim {
     return rec;
   }
 
+  // Mark a part's endo-skeleton as visually exposed (skinned concrete). The renderer swaps the
+  // concrete material to a translucent "chipped" look so the rust lattice reads through —
+  // like broken bones, matching skinned-slab reference photos.
+  _exposeRebar(part) {
+    if (!part || part.dead || part.rebarExposed) return;
+    part.rebarExposed = true;
+    this.onExpose(part);
+  }
+
   // concrete cracks: replace a rigid weld with a revolute HINGE along `hingeAxis`, so the
   // pieces fold but stay connected by "rebar" (removed only if later torn/cut through).
   _crackJoint(rec, hingeAxis) {
@@ -236,6 +320,9 @@ export class RubbleSim {
     rec.hingeAxis = hingeAxis;
     rec.cracked = true;
     this.stats.cracks++;
+    // the fracture opens the concrete — reveal the lattice on both sides of the seam
+    this._exposeRebar(rec.a);
+    this._exposeRebar(rec.b);
   }
 
   _crackTie(rec) { this._crackJoint(rec, rec.hingeAxis); }
@@ -283,7 +370,7 @@ export class RubbleSim {
     this.clear();
     this.rng = makeRng(this.opts.seed);
     const o = this.opts, B = o.buildingSize, g = o.grid, sh = o.storyHeight, st = o.slabThickness;
-    const spacing = B / g, tileHalf = spacing / 2 * 0.98, th = o.rebarThickness;
+    const spacing = B / g, tileHalf = spacing / 2 * 0.98;
     const lines = Array.from({ length: g }, (_, i) => -B / 2 + spacing * (i + 0.5));
 
     for (let s = 0; s < o.stories; s++) {
@@ -299,23 +386,16 @@ export class RubbleSim {
       for (const z of [lo, hi]) { const m = this._member('beam', { x: lo, y: topY, z }, { x: hi, y: topY, z }, o.beamSize, o.beamSegments, o.densityMember, true); m.story = s; }
       for (const x of [lo, hi]) { const m = this._member('beam', { x, y: topY, z: lo }, { x, y: topY, z: hi }, o.beamSize, o.beamSegments, o.densityMember, true); m.story = s; }
 
-      // floor = grid of concrete tiles tied edge-to-edge by rebar (a coherent panel)
+      // floor = grid of concrete tiles tied edge-to-edge by rebar (a coherent panel).
+      // Each tile carries a 3D rectangular rebar lattice (rebarLayers stacked X–Z mats +
+      // vertical stirrups) — the endo-skeleton of reinforced concrete. Hidden under intact
+      // opaque concrete; revealed like broken bones when the tile cracks, is cut, or spalls.
       const slabY = topY + o.beamSize / 2 + st / 2;
       const tiles = [];
       for (let i = 0; i < g; i++) {
         tiles[i] = [];
         for (let j = 0; j < g; j++) {
-          // reinforcement skeleton: a dense grid of thin cylindrical rods EMBEDDED at the
-          // slab's mid-plane (hidden in intact concrete; exposed as frayed ends at breaks/cuts).
-          // Rods run slightly past the tile so their ends protrude at fractures/edges.
-          const tileRebars = [];
-          const n = Math.max(2, Math.round((tileHalf * 2) / o.rebarSpacing));
-          const len = tileHalf * 2 + 2 * o.rebarFray;
-          for (let k = 0; k <= n; k++) {
-            const u = -tileHalf + (tileHalf * 2) * (k / n);
-            tileRebars.push({ x: 0, y: 0, z: u, len, r: th, axis: 'x' });
-            tileRebars.push({ x: u, y: 0, z: 0, len, r: th, axis: 'z' });
-          }
+          const tileRebars = buildSlabRebarLattice(tileHalf, st, o);
           tiles[i][j] = this._addBox({ hx: tileHalf, hy: st / 2, hz: tileHalf },
             { x: lines[i], y: slabY, z: lines[j] }, null, 'slab',
             { fixed: true, density: o.densityConcrete, events: true, rebars: tileRebars });
@@ -372,10 +452,10 @@ export class RubbleSim {
     if (this.phase === 'collapsing' || this.phase === 'frozen') return;
     const R = this.R, o = this.opts, frame = this.frame;
     const profile = o.failureProfile || 'softStory';
+    const mid = Math.max(0, Math.min(o.stories - 1, Math.floor(o.stories / 2)));
     this.collapseReport = { profile, initiators: [], cascade: 0 };
 
     if (frame) {
-      const mid = Math.max(0, Math.min(o.stories - 1, Math.floor(o.stories / 2)));
       const initiate = (nodes, spall, fixity) => {
         for (const c of nodes) {
           frame.damageColumn(c, spall);
@@ -491,6 +571,9 @@ export class RubbleSim {
     this.world.removeImpulseJoint(rec.joint, true);
     if (rec.type === 'member') { rec.member.breaks++; this.stats.snaps++; }
     else this.stats.tears++;
+    // snapped / torn members expose their cage like broken bones
+    this._exposeRebar(rec.a);
+    this._exposeRebar(rec.b);
   }
 
   /**
@@ -721,10 +804,12 @@ export class RubbleSim {
     const rec = this.joints.find((r) => r.type === 'tie' && !r.cracked && !r.broken &&
       !r.a.dead && !r.b.dead && (r.a === target || r.b === target));
     if (rec) this._crackTie(rec);
+    // hammer chips the face even without a seam crack — skin the concrete so the cage shows
+    this._exposeRebar(target);
     this._wakeNear(point, this.opts.wakeRadius);
     this.stats.cuts++;
     this.phase = 'collapsing';
-    return { spalled, exposed: !!rec, part: target };
+    return { spalled, exposed: true, part: target };
   }
 
   /**
@@ -791,6 +876,8 @@ export class RubbleSim {
       if (onDropSide) this._movePartInJoint(rec, slab, spawned, delta);
     }
 
+    this._exposeRebar(slab);
+    if (spawned) this._exposeRebar(spawned);
     this.stats.cuts++;
     this.phase = 'collapsing';
     this._wakeNear(wpos, o.wakeRadius);
@@ -829,22 +916,28 @@ export class RubbleSim {
     }
     slab.col = slab.colliders[0] || null;
     slab.frame = frame;                                    // renderer rebuilds mesh from this
-    // keep the rebar but trim it to the hole -> frayed ends stick into the opening
+    // keep the rebar but trim it to the hole -> frayed ends stick into the opening;
+    // the cut-out middle of the lattice rides with the plug
+    const plugRebars = extractRebarForHole(slab.rebars, holeCx, holeCz, rx, rz);
     slab.rebars = clipRebarForHole(slab.rebars, holeCx, holeCz, rx, rz, this.opts.rebarFray);
+    this._exposeRebar(slab);
     this.onReshape(slab);
 
     // spawn the plug at the hole location (tile local -> world), a touch smaller than the hole
-    // so it isn't wedged against the frame edges, as a falling piece
+    // so it isn't wedged against the frame edges, as a falling piece carrying its cage
     const t = slab.body.translation(), q = slab.body.rotation();
     const off = rotateVec(q, { x: holeCx, y: 0, z: holeCz });
     const plug = this._addBox({ hx: rx * 0.9, hy: s.hy * 0.95, hz: rz * 0.9 },
       { x: t.x + off.x, y: t.y + off.y, z: t.z + off.z }, q, 'fragment',
-      { fixed: false, density: o.densityConcrete });
+      { fixed: false, density: o.densityConcrete, rebars: plugRebars });
 
     // the plug must leave with the momentum it already had (specs.md §3.1.3) — a plug cut out of
     // a slab that is itself falling or tilting should keep moving with it
     const wc = { x: t.x + off.x, y: t.y + off.y, z: t.z + off.z };
-    if (plug) this._inheritMomentum(slab.body, plug.body, wc);
+    if (plug) {
+      this._inheritMomentum(slab.body, plug.body, wc);
+      this._exposeRebar(plug);   // skinned fragment — lattice visible through chipped concrete
+    }
 
     // wake the local region so the plug and nearby debris re-settle
     this._wakeNear(wc, this.opts.wakeRadius);
