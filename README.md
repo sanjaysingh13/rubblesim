@@ -268,6 +268,10 @@ GitHub Actions example above).
 - The bundle is ~2.5 MB raw / ~0.9 MB gzipped — mostly three.js + inlined Rapier WASM.
   **Enable server compression** and it's a sub-1 MB transfer. The Vite "chunk > 500 kB"
   warning is expected and harmless for a single-bundle PoC.
+- **The rebar lattice is the vertex-count knob.** Stirrups scale as *n²* in the grid resolution,
+  so halving `rebarSpacing` is far costlier than doubling `rebarLayers`. At defaults it is
+  ~22k rods / ~880k vertices for a 4-storey building, merged into one mesh per part (draw calls
+  stay flat). Widen the spacing first if the frame rate drops.
 - To split vendor code for better caching, add `build.rollupOptions.output.manualChunks`
   in `vite.config.js` (e.g. separate `three` and `@dimforge/rapier3d-compat`). Not
   required for correctness.
@@ -349,6 +353,25 @@ Impact thresholds (`slabCrackForce`, `beamSnapForce`, `slabTearAngle`, …) are 
 calibrated *numerical proxy* — a solver's peak contact force over one dt is far spikier than a
 sustained flexural load. Pick them off a measured distribution with `npm run measure`, never by
 guessing. All are tunable live in the GUI and documented as `DEFAULTS` in `sim.js`.
+
+### Reinforcement — an endo-skeleton you only see where it breaks
+
+Every slab tile carries a **3D rebar lattice**, not a single mid-plane grid: `rebarLayers`
+planar X–Z mats stacked between the cover faces, tied by a **vertical stirrup at each grid
+node**. Defaults (`rebarSpacing` 0.10 m, rod radius 0.008 m, `rebarCover` 0.022 m) are a real
+light floor mat — ~16 mm bars at ~10 cm centres — and work out to **609 rods per tile**
+(84 + 84 mat bars, 441 stirrups). Columns and beams keep their 4-bar cage.
+
+The cage is **hidden inside intact concrete**, exactly as in life. It is revealed only when
+something actually opens the concrete — a seam **cracks**, a joint **snaps or tears**, the cutter
+opens a **hole**, the saw **slices** a tile, or the hammer **spalls** a face. The sim raises
+`onExpose` for that part and the renderer reveals the rods and swaps the concrete to a
+translucent "chipped cover" material, so the lattice reads through like a broken bone. A default
+collapse exposes ~30 of 177 settled parts — steel appears at the fractures and nowhere else.
+
+Rebar is **visual only** (descriptors merged into one child mesh per part); mass and the collapse
+tuning come from densities, so changing the lattice cannot change the physics. Tune it live in the
+GUI's **Rebar lattice** folder.
 
 ### Structural model (in `structure.js`)
 

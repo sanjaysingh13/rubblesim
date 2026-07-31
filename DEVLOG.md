@@ -360,6 +360,57 @@ screen have to be real kN**, or shoring/lifting/buckling decisions are theatre.
 - lil-gui sidebar is ~245 px wide; anything positioned on the right is hidden behind it. All
   readouts moved to the left column.
 
+## Iteration 13 — the rebar lattice is an endo-skeleton (hidden until the concrete breaks)
+
+Reference photos of skinned slabs settle two things iteration 11c got half-right: real RC floor
+slabs are **not** one mid-plane grid, and in an intact slab you see **no steel at all**. So the
+reinforcement became a 3D cage, and its visibility became an *event*, not a constant.
+
+### The lattice (`buildSlabRebarLattice`, sim.js)
+- Several planar X–Z mats **stacked through the thickness** between the cover faces, tied by a
+  **vertical stirrup at every grid node** — a rectangular cage, not a plane. New params
+  `rebarLayers` (4) and `rebarCover` (0.022 m); `rebarSpacing` 0.2 → **0.10 m** and rods stay at
+  r = 0.008 m, i.e. ~16 mm bars at ~10 cm centres, which is a real light floor mat.
+- Measured on the default 4-storey build: **609 rods per tile** (84 running X, 84 running Z,
+  **441 stirrups**), 36 tiles, **21,924 slab rods / 22,548 total**. The stirrups outnumber the
+  mats 2.6 : 1 — a stacked-mat count of `layers × 2(n+1)` is the *small* term, and doubling
+  `rebarLayers` costs far less than halving `rebarSpacing` (stirrups go as n²).
+- Still **visual-only**: rods are descriptors carried by the part and merged into one child mesh,
+  so physics is untouched. Confirmed unchanged post-collapse: 10 cracks, 7 snaps, 0 tears, 177
+  parts settled — inside the iteration 6/12 envelope, and all seven headless suites pass.
+- Cylinders dropped 8 → **6 radial segments**: 40 verts/rod instead of 52 (measured), ~23% off a
+  budget that is now ~880k verts of rebar across 36 merged meshes. Draw calls are unaffected —
+  one merged mesh per part is what makes a 600-rod cage affordable at all.
+
+### Exposure: `onExpose` (a fifth sim → renderer callback)
+- Rebar meshes are built **hidden** (`visible = false`) and revealed only when the concrete
+  actually opens: a tie **cracks**, a joint **snaps or tears**, the cutter opens a **hole**, the
+  saw **slices** a tile, or the hammer **spalls** a face. `_exposeRebar(part)` is idempotent and
+  fires `onExpose` once per part. Measured: **0 of 204 parts exposed at build; 30 of 177 after a
+  collapse** — the pile shows steel exactly at its fractures.
+- The renderer answer to "how do you see a cage inside a solid box" is a **skinned concrete**
+  material — same grey, `transparent` at opacity 0.65–0.70 with `depthWrite` left **on**. The
+  rebar child is opaque, so it draws in the opaque pass *before* the shell and reads through it;
+  keeping depth-write means skinned pieces still occlude the pile behind them properly.
+- Rebar tint went 0xb04a24 → **0x904428** with lower metalness. At 600 rods/tile the old rust was
+  a solid red wash at any distance; the frame has to stay grey concrete with steel *inside* it.
+- `onExpose` swaps materials only — no mesh rebuild — and re-applies through the stress map, so
+  exposing a part mid-collapse doesn't fight the grey→red bucket materials.
+
+### The plug used to fall as plain concrete
+- `clipRebarForHole` trimmed the slab's rods to the hole rim (frayed ends, iteration 11c) but the
+  **cut-out square itself** got none of them. New `extractRebarForHole` is its exact inverse: the
+  rod segments *inside* the footprint, recentred into the plug's local frame, handed to the
+  spawned fragment — which is then exposed, so a plug reads as a chunk of RC with its cage
+  showing rather than a grey block.
+- `clipRebarForHole` also learned about stirrups: an `axis:'y'` rod inside the hole footprint
+  leaves with the plug instead of hanging in the opening.
+
+### Guardrail
+- Rebar now has **two** independent reasons to be invisible: the layer-1 camera trap from
+  iteration 12, and `rebarExposed` being false. Before debugging a missing cage, check which —
+  "no steel on an intact building" is now the correct behaviour.
+
 ## Gotchas / guardrails
 
 - **Black screen = a load-time exception, not a render bug.** Root cause once: `main.js`
@@ -388,5 +439,6 @@ screen have to be real kN**, or shoring/lifting/buckling decisions are theatre.
 - True visible **bending** of members (needs soft-body/FEM, or a visual-only mesh-bend).
 - **Void reachability** — which detected voids connect to the surface (the real USAR question).
 - **Victim placement** at void centres using the exported ground-truth JSON.
-- Concrete **cover-spall** on beams so steel is exposed "by cutting", per the photos.
+- ~~Concrete **cover-spall** so steel is exposed "by cutting", per the photos.~~ Done in
+  iteration 13 — the hammer spalls a face and `onExpose` skins the concrete over the cage.
 - Perf: ~150–250 bodies during collapse; watch frame rate as `grid`/`stories` grow.
