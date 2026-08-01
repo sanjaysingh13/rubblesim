@@ -43,15 +43,26 @@ export function postCapacity(side, length, K = 1.0) {
   return { crush, euler, capacity: Math.min(crush, euler), governing: euler < crush ? 'buckling' : 'crush' };
 }
 
+// Extension ladder for USAR access when a natural pull-up (~7–8 ft) is not enough.
+export const LADDER_SPEC = {
+  id: 'extLadder',
+  label: 'Extension ladder',
+  length: 3.5,       // m — typical portable ladder reach
+  width: 0.45,
+};
+
 export class RescueOps {
   constructor(sim) {
     this.sim = sim;
     this.bags = [];
     this.shores = [];
+    this.ladders = [];
     this.events = [];        // {type, ...} drained by the renderer for HUD messages
   }
 
-  clear() { this.bags.length = 0; this.shores.length = 0; this.events.length = 0; }
+  clear() {
+    this.bags.length = 0; this.shores.length = 0; this.ladders.length = 0; this.events.length = 0;
+  }
   emit(e) { this.events.push(e); return e; }
   drainEvents() { const e = this.events.slice(); this.events.length = 0; return e; }
 
@@ -98,6 +109,15 @@ export class RescueOps {
     const upper = this._partByRay(point, +1);
     const lower = this._partByRay(point, -1, 1.2);
     if (!upper) { this.emit({ type: 'BAG_NO_INTERFACE', point }); return null; }
+    // Cement chips sit on slab tops — skip them so the bag engages the structural slab below.
+    let liftTarget = upper;
+    for (let skip = 0; skip < 8 && liftTarget?.kind === 'fragment'; skip++) {
+      const t = liftTarget.body.translation();
+      const next = this._partByRay(
+        { x: point.x, y: t.y + liftTarget.shape.hy + 0.04, z: point.z }, +1);
+      if (!next || next === liftTarget) break;
+      liftTarget = next;
+    }
 
     // The bag's contact surface is a constant-size kinematic platform that RISES; it is not a
     // collider that gets resized. setNextKinematicTranslation gives the solver a proper contact
@@ -113,10 +133,10 @@ export class RescueOps {
         .setFriction(sim.opts.friction).setRestitution(0), body);
 
     const bag = {
-      spec, point: { ...point }, upper, lower,
+      spec, point: { ...point }, upper: liftTarget, lower,
       capacity: spec.tonnes * sim.opts.gravity,     // kN
       maxLift: spec.maxLift,
-      y0: upper.body.translation().y,
+      y0: liftTarget.body.translation().y,
       baseY: point.y, plate,
       body, col,
       lift: 0, inflated: false, stalled: false,
@@ -163,7 +183,11 @@ export class RescueOps {
     bag.rawLoad = W;
     bag.relief = this.shoreReliefAt(bag.point, 1.5);
     bag.load = Math.max(0, W - bag.relief);
-    bag.stalled = bag.load > bag.capacity;
+    // Must match the test that actually gates inflation in updateBags, or the reported state and
+    // the observed behaviour disagree: the estimate alone once read "not stalled" for a bag that
+    // was measuring twice its rating at the contact and had not moved a millimetre.
+    bag.stalled = (bag.load > bag.capacity || bag.carrying > bag.capacity)
+      && bag.lift < bag.maxLift - 1e-3;
     return bag;
   }
 
@@ -405,6 +429,98 @@ export class RescueOps {
     }
   }
 
+  /**
+   * Place an extension ladder against a near-vertical face at `point`.
+   * The ladder leans from the ground (or debris under the point) up along the surface normal
+   * toward the hit, so a rescuer can mount it and climb past a wall that is too tall to mantle.
+   */
+  placeLadder(point, length = LADDER_SPEC.length) {
+    const sim = this.sim, R = sim.R;
+    // Find a nearby surface by casting horizontally in several directions from the click.
+    let best = null;
+    for (let i = 0; i < 8; i++) {
+      const ang = (i / 8) * Math.PI * 2;
+      const dir = { x: Math.cos(ang), y: 0, z: Math.sin(ang) };
+      const ray = new R.Ray({ x: point.x, y: point.y + 0.4, z: point.z }, dir);
+      const hit = sim.world.castRay(ray, 2.5, true);
+      if (!hit || hit.timeOfImpact > 2.0) continue;
+      const part = sim.colliderToPart.get(hit.collider.handle);
+      if (!part || part.shore || part.ladder || part.agent) continue;
+      if (!best || hit.timeOfImpact < best.toi) {
+        best = { toi: hit.timeOfImpact, dir, part, ang };
+      }
+    }
+    if (!best) {
+      this.emit({ type: 'LADDER_NO_FACE', point });
+      return null;
+    }
+
+    // Normal points away from the wall (opposite of cast direction into the face).
+    const nx = -best.dir.x;
+    const nz = -best.dir.z;
+    const faceX = point.x + best.dir.x * best.toi;
+    const faceZ = point.z + best.dir.z * best.toi;
+
+    // Base sits on whatever is under the face (ground / debris).
+    const down = new R.Ray({ x: faceX + nx * 0.4, y: point.y + 2.0, z: faceZ + nz * 0.4 }, { x: 0, y: -1, z: 0 });
+    const groundHit = sim.world.castRay(down, 6.0, true);
+    const baseY = groundHit ? (down.origin.y - groundHit.timeOfImpact) : 0;
+    const base = { x: faceX + nx * 0.55, y: baseY, z: faceZ + nz * 0.55 };
+    // Top leans into the wall — climbable length along the rail.
+    const lean = 0.25; // horizontal inset toward the wall at the top
+    const top = {
+      x: faceX + nx * lean,
+      y: baseY + length,
+      z: faceZ + nz * lean,
+    };
+    const actualLen = Math.hypot(top.x - base.x, top.y - base.y, top.z - base.z);
+
+    // Thin fixed collider so the character controller can rest against the ladder rails.
+    const mid = {
+      x: (base.x + top.x) / 2,
+      y: (base.y + top.y) / 2,
+      z: (base.z + top.z) / 2,
+    };
+    // Approximate orientation: ladder rises mostly in Y; we store base/top for climb math and
+    // use a vertical box collider at mid for crude blocking.
+    const p = sim._addBox(
+      { hx: LADDER_SPEC.width / 2, hy: actualLen / 2, hz: 0.04 },
+      mid,
+      null,
+      'ladder',
+      { fixed: true, density: 0.5, events: false },
+    );
+    if (!p) {
+      this.emit({ type: 'LADDER_NO_ROOM', point });
+      return null;
+    }
+    p.ladder = true;
+    p.agent = false;
+
+    const ladder = {
+      spec: LADDER_SPEC,
+      base,
+      top,
+      normal: { x: nx, y: 0, z: nz },
+      length: actualLen,
+      part: p,
+      parts: [p],
+      active: true,
+      yaw: Math.atan2(nx, nz),
+    };
+    p.ladderRef = ladder;
+    this.ladders.push(ladder);
+    this.emit({ type: 'LADDER_PLACED', ladder });
+    return ladder;
+  }
+
+  removeLadder(ladder) {
+    const i = this.ladders.indexOf(ladder);
+    if (i >= 0) this.ladders.splice(i, 1);
+    for (const p of ladder.parts || []) this.sim._removePart(p);
+    ladder.active = false;
+  }
+
   /** Called once per rendered step, after the substeps. */
   postStep() {
     this.measureShores();
@@ -427,6 +543,9 @@ export class RescueOps {
         label: s.spec.label, capacity: s.capacity, carrying: s.carrying,
         utilization: s.capacity > 0 ? s.carrying / s.capacity : 0,
         governing: s.governing, failed: s.failed, length: s.length,
+      })),
+      ladders: this.ladders.map((l) => ({
+        label: l.spec.label, length: l.length, active: l.active,
       })),
     };
   }

@@ -16,21 +16,38 @@ for (let f = 0; f < 9 * 60; f++) sim.step();
 sim.freeze();
 sim.support.rebuild();
 
-// Lift the most heavily loaded slab in the pile — the worst realistic case. The bag goes just
-// under its underside so the ray-based interface detection finds it directly overhead.
-function pickTarget() {
+// What the debris actually puts on a slab, read from the contacts carrying it: impulse ÷ timestep
+// is force, and with masses in tonnes that comes out directly in kN. `supportedLoad` is the
+// tributary-area estimate used by the HUD; this is the load the bag will really have to jack.
+function surchargeKN(part) {
+  let down = 0;
+  for (const c of sim._contactsOf(part)) {
+    if (c.imp > 1e-5 && c.ny < -0.15) down += c.imp * -c.ny;
+  }
+  return down / sim.world.timestep;
+}
+
+// Two different targets, because the spec asks two different questions. The stall case wants the
+// worst slab in the pile; the lift case wants one the bag is genuinely rated for — jacking a slab
+// buried under half a meganewton of rubble is meant to fail.
+function pickTarget({ maxLoadKN = Infinity, lightest = false } = {}) {
   sim.support.rebuild();
   const ranked = sim.parts.filter((p) => !p.dead && p.kind === 'slab')
-    .map((p) => ({ p, load: sim.support.supportedLoad(p) }))
-    .sort((a, b) => b.load - a.load);
+    .map((p) => ({ p, load: sim.support.supportedLoad(p), demand: surchargeKN(p) + p.body.mass() * 9.81 }))
+    .filter((r) => r.demand <= maxLoadKN)
+    .sort((a, b) => (lightest ? a.demand - b.demand : b.load - a.load));
   if (!ranked.length) return null;
   const best = ranked[0];
   const t = best.p.body.translation();
-  return { part: best.p, load: best.load, point: { x: t.x, y: t.y - best.p.shape.hy - 0.12, z: t.z } };
+  return {
+    part: best.p, load: best.load, demand: best.demand,
+    point: { x: t.x, y: t.y - best.p.shape.hy - 0.12, z: t.z },
+  };
 }
 const first = pickTarget();
 if (!first) { console.log('FAIL: no slab to lift'); process.exit(1); }
-console.log(`target slab: supported load ${first.load.toFixed(1)} kN, bagging at y=${first.point.y.toFixed(2)} m`);
+console.log(`worst slab: supported load ${first.load.toFixed(1)} kN, debris on it ${first.demand.toFixed(0)} kN, ` +
+  `bagging at y=${first.point.y.toFixed(2)} m`);
 
 const maxAbsNow = () => {
   let m = 0;
@@ -38,8 +55,8 @@ const maxAbsNow = () => {
   return m;
 };
 
-function trial(id, steps) {
-  const tgt = pickTarget();          // re-locate: the pile shifts between trials
+function trial(id, steps, pick = {}) {
+  const tgt = pickTarget(pick);      // re-locate: the pile shifts between trials
   if (!tgt) return null;
   const bag = sim.rescue.placeBag(tgt.point, id);
   if (!bag) return null;
@@ -55,7 +72,10 @@ function trial(id, steps) {
 }
 
 const small = trial('bag4t', 300);
-const big = trial('bag20t', 480);
+// 20 t bag = 196 kN rating; give it a slab the bag is genuinely rated for. Every slab in the pile
+// is tied to a neighbour by rebar, and ties only tear by FOLDING past `slabTearAngle` — steady
+// jacking force never breaks one — so the bag has to lift the tied group with it.
+const big = trial('bag20t', 480, { maxLoadKN: 100, lightest: true });
 for (const r of [small, big]) {
   if (!r) { console.log('FAIL: bag found no lift interface'); process.exit(1); }
   console.log(`${r.label.padEnd(18)} rating ${r.capacity.toFixed(0).padStart(4)} kN · W_debris ` +

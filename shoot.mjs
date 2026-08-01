@@ -21,8 +21,16 @@ const status1 = await page.evaluate(() => document.getElementById('status')?.tex
 await page.screenshot({ path: `${OUT}/cut_1_collapsed.png` });
 console.log('collapsed:', status1);
 
-// select the concrete cutter, then move the mouse over the pile so the blade cursor engages
-await page.evaluate(() => { window.__app.params.equipment = 'Concrete cutter'; window.__app.setEquipment('Concrete cutter'); });
+// Equipment is locked until a rescuer is on site (DEVLOG 2026-08-01), and the cutter only works
+// at arm's length — so put a man on the pile first, then take manual camera control back off him.
+await page.evaluate(() => {
+  window.__app.spawnRescuer();
+  window.__app.params.rescuerMode = false;      // free orbit; he stays wherever we park him
+});
+await page.waitForTimeout(300);
+
+// Select the concrete cutter — he holds it; right-click on an eligible spot will cut.
+await page.evaluate(() => { window.__app.setEquipment('Concrete cutter'); });
 await page.mouse.move(620, 470);
 await page.mouse.move(640, 500);   // a second move so pointermove fires with a delta
 await page.waitForTimeout(300);
@@ -50,10 +58,17 @@ const targets = await page.evaluate(() => {
 console.log(`aiming at ${targets.length} intact slabs:`, targets.map((t) => `(${t.x.toFixed(1)}, ${t.y.toFixed(1)}, ${t.z.toFixed(1)})`).join(' and '));
 
 const cutAt = async (world) => {
+  // Park the rescuer beside this tile and face him at it — the cutter refuses anything outside his
+  // working sphere, so a driver has to walk him to the work exactly as a player would.
+  await page.evaluate((w) => {
+    window.__app.teleportRescuer(
+      { x: w.x + 0.55, y: w.y + 0.15, z: w.z + 0.55 }, Math.atan2(-0.55, -0.55), false);
+  }, world);
   const s = await page.evaluate((w) => window.__app.project(w), world);
   await page.mouse.move(s.x, s.y); await page.mouse.move(s.x + 3, s.y + 2);
   await page.mouse.click(s.x, s.y, { button: 'right' });
   await page.waitForTimeout(1600); await page.evaluate(() => window.__app.doFreeze());
+  await page.waitForFunction(() => window.__app.phase() === 'frozen', null, { timeout: 10000 });
   await page.waitForTimeout(200);
   return page.evaluate(() => {
     const c = window.__app.lastCut();
@@ -73,9 +88,9 @@ console.log(`cuts=${b.cuts}  parts=${stats.parts}  distance between the two hole
 console.log(dist > 0.4 ? 'OK: the two aimed cuts landed at different spots (not a fixed random fallback).'
                        : 'WARN: the two cuts landed at ~the same spot — check aiming.');
 
-// hide void markers + the tool blade, then look down INTO the hole (frayed rebar at the rim)
+// hide void markers, drop the tool, then look down INTO the hole (frayed rebar at the rim)
 await page.keyboard.press('v');
-await page.evaluate(() => { window.__app.params.equipment = 'None'; window.__app.setEquipment('None'); });
+await page.evaluate(() => { window.__app.setEquipment('None'); });
 await page.evaluate(() => {
   const { camera, controls, lastCut } = window.__app;
   const p = lastCut();
@@ -88,7 +103,9 @@ await page.screenshot({ path: `${OUT}/cut_4_closeup.png` });
 
 // --- rebar cutter: aim the pliers at an exposed rebar (cracked tie) and screenshot ---
 await page.keyboard.press('v');   // show void markers again off
-await page.evaluate(() => { window.__app.params.equipment = 'Rebar cutter'; window.__app.setEquipment('Rebar cutter'); });
+// The pliers are not reach-gated yet (equipment.js: needsReach false), so free aim still applies —
+// but they still cannot be SELECTED without a rescuer on site, which the spawn above provides.
+await page.evaluate(() => { window.__app.setEquipment('Rebar cutter'); });
 const rb = await page.evaluate(() => window.__app.firstRebar());
 if (rb) {
   await page.evaluate((w) => { const { camera, controls } = window.__app; camera.position.set(w.x + 1.6, w.y + 1.3, w.z + 1.6); controls.target.set(w.x, w.y, w.z); controls.update(); }, rb);

@@ -35,28 +35,53 @@ export const DEFAULTS = {
   beamSize: 0.34,
   slabThickness: 0.22,
   furniturePerFloor: 3,
-  colSegments: 3,
-  beamSegments: 3,
-  // Slab reinforcement is a 3D rectangular lattice (the endo-skeleton of RC): several planar
-  // X–Z grids stacked through the slab thickness, tied by vertical stirrups at each grid node.
-  // Rods are visual-only (ride as child meshes); physics cost is zero. Defaults aim at the
-  // ~1–2 cm bars / ~10–15 cm centres of real light RC floor slabs (see reference skinned photos).
-  rebarThickness: 0.008,   // rod RADIUS (m) — ~16 mm dia (1–2 cm real bars), visible when skinned
-  rebarSpacing: 0.10,      // planar grid spacing (m) — ~10 cm centres, dense RC floor mat
-  rebarLayers: 4,          // stacked planar lattices through the slab thickness (top/bottom mats + inner)
-  rebarCover: 0.022,       // concrete cover (m) — inset of outer layers from the slab faces
+  colSegments: 5,
+  beamSegments: 6,
+  // Slab/beam reinforcement: 3D rectangular lattice — stacked X–Z mats at top & bottom (+ optional
+  // inner layers), vertical stirrups at grid nodes. Visual-only rods; physics uses tile tie joints.
+  rebarThickness: 0.008,   // rod RADIUS (m) — ~16 mm dia (1–2 cm real bars)
+  rebarSpacing: 0.30,      // planar grid spacing (m) — 300 mm square mesh pitch
+  rebarLayers: 2,            // mats through thickness (default: top + bottom only)
+  rebarCover: 0.040,       // depth of each mat from the slab top/bottom face (m) — 40 mm
   rebarFray: 0.05,         // how far cut rod ends protrude ("frayed ends") at holes/edges
   // physics — UNITS: length m, mass tonnes (Mg), time s  =>  force kN, stress kPa.
   // (Real g; the "heavy, non-bouncy" feel comes from restitution/damping/mass, not fake gravity.)
   gravity: 9.81,
-  restitution: 0.10,       // concrete-on-concrete: dead thud, not a bounce
-  friction: 0.9,
+  restitution: 0.05,       // concrete-on-concrete: dead thud, not a bounce
+  // Coulomb friction μ. Dry concrete–concrete is typically ~0.6–0.8; we use 0.65 so a slab on a
+  // face steeper than atan(μ)≈33° slides instead of sticking forever. Furniture is lower.
+  friction: 0.65,
+  frictionFurniture: 0.35,
   linearDamping: 0.08,
   angularDamping: 0.30,
   densityConcrete: 2.4,    // Mg/m³ — plain concrete
   densityMember: 2.5,      // Mg/m³ — reinforced concrete (columns/beams: concrete + rebar)
   densitySteel: 7.85,      // Mg/m³ — steel (rebar area in the capacity checks)
   substeps: 3,
+  // ---- equilibrium check (contact-based — see _equilibriumOf) ----
+  // Read from Rapier's narrow phase (real contact points / normals / solver impulses), NOT from
+  // downward raycasts: in a rubble pile most load paths run through wedged and leaning faces.
+  equilibriumEveryNFrames: 10,  // how often, while collapsing, resting pieces are re-tested
+  maxWakeAttempts: 3,           // give up re-waking a piece the solver clearly intends to hold
+  flexuralStrengthCoef: 0.33,   // f_ct ≈ 0.33·√f'c (MPa) — modulus of rupture of plain concrete
+  plainConcretePhi: 0.6,        // derate that: brittle, scatters badly, and already impact-damaged
+  killPlaneY: -1.5,             // m — debris below the floor has left the simulation
+  maxDebrisSpeed: 25,           // m/s — free fall from this building tops out near 20; faster is numerical
+  maxDebrisSpin: 25,            // rad/s
+  supportImpulseMin: 1e-5,      // solver normal impulse below this is not a load path
+  supportNormalMinY: 0.15,      // upward normal component that makes a contact gravity-resisting
+  minReactionFrac: 0.30,        // reaction below this fraction of the weight ⇒ nothing holds it
+  freeLoadFrac: 0.25,           // debris load from above under this fraction ⇒ still free-standing
+  tipMargin: 0.03,              // m — CoG must fall this far OUTSIDE the support polygon to tip
+  slipMargin: 0.05,             // tan(α) must exceed μ by this before we call it sliding
+  // Rest is judged by DRIFT rather than instantaneous velocity: the rebar ties keep a settled
+  // pile buzzing with sub-centimetre jitter for ever, but a piece that has not gone anywhere in
+  // half a second has plainly stopped.
+  restWindowFrames: 30,         // ≈0.5 s between drift samples
+  restDrift: 0.03,              // m moved within one window before we call it "still moving"
+  restSpeedCap: 1.0,            // m/s — obviously in flight, don't wait for the next sample
+  restLinVel: 0.05,             // m/s — velocity fallback before the first drift sample exists
+  restAngVel: 0.15,             // rad/s
   // failure
   // Impact triggers are a NUMERICAL PROXY, not a code check: a rigid-body solver's peak contact
   // force over one dt is far spikier than a sustained flexural load, so these are calibrated off
@@ -64,7 +89,7 @@ export const DEFAULTS = {
   // of impacts. The dimensionally-meaningful capacity checks (cracking moment, crush, Euler
   // buckling) act on static tributary loads in src/structure.js.
   contactEventThreshold: 10,   // kN — below this is solver noise (p50 ≈ 1.5–4 kN)
-  beamSnapForce: 1150,     // kN impact that snaps a member joint (≈5× p99 of member contacts)
+  beamSnapForce: 950,      // kN — weak RC snaps more readily (was 1150 for nominal 25 MPa mix)
   // Rigid-body members barely bend (measured max 0.9° at real g — see DEVLOG iter 4), so this is
   // a near-inert backstop for extreme kinks, NOT the main member-failure path. Real member
   // failure is beamSnapForce plus the axial crush/buckling check in src/structure.js.
@@ -72,12 +97,18 @@ export const DEFAULTS = {
   slabCrackForce: 1400,    // kN impact cracks one concrete seam -> rebar hinge (sparse = large pieces)
   slabTearAngle: 0.9,      // fold where the REBAR itself tears — p99.9 of measured hinge folds,
                            // so full separation stays RARE and panels remain coherent
-  maxBreaksPerMember: 1,   // members snap into at most 2 pieces (never shatter)
+  maxBreaksPerMember: 2,   // members can splinter into up to 3 lengths (skimped concrete)
   wakeRadius: 3.0,         // radius of pieces re-woken to re-settle after an equipment cut
   maxParts: 2500,
   // ---- structural evaluation (src/structure.js) — real code-level values ----
   concreteE: 25e6,         // kPa (25 GPa) — Young's modulus, normal-weight concrete
-  concreteFc: 25e3,        // kPa (25 MPa) — characteristic cylinder strength f'c
+  concreteFc: 17e3,        // kPa (17 MPa) — DEFAULT poor site mix (under-cemented, high sand)
+  concreteFcRef: 25e3,     // kPa — reference strength for dust/spall scaling (nominal design mix)
+  splinterChips: 2,        // concrete chips spawned at each member snap
+  splinterScale: 0.22,     // chip size as fraction of member cross-section
+  splinterOnCrack: 0,      // slab seam chips (off — beams/columns snap is where splintering reads)
+  dustContactForce: 350,   // kN — contact above this emits a dust puff
+  dustCollapseBurst: 100,  // particles when collapse initiates
   steelFy: 415e3,          // kPa (415 MPa) — rebar yield strength
   deadLoadSuper: 1.5,      // kPa — superimposed dead load (finishes, partitions, services)
   liveLoadFloor: 2.0,      // kPa — occupancy live load
@@ -91,10 +122,47 @@ export const DEFAULTS = {
   endFixityPinned: 1.0,    // Euler K — framing at one end cracked/severed
   endFixityFree: 2.0,      // Euler K — top unrestrained (slab above gone) = cantilever
   failureProfile: 'softStory',  // 'softStory' | 'pancake' | 'progressive'
-  spallOnCut: 0.35,        // fraction of a column's section lost when a tool cuts into it
+  spallOnCut: 0.48,        // fraction of a column's section lost when a tool cuts into it (brittle cover)
   // void detection
   voidGrid: 9,
   minVoidHeight: 0.9,      // only clearly survivable pockets
+};
+
+// Convex hull of contact points projected onto the ground plane (monotone chain, CCW order).
+// This is the support polygon: the footprint gravity has to stay inside for a piece not to tip.
+const convexHullXZ = (points) => {
+  const sorted = points
+    .map((p) => ({ x: p.x, z: p.z }))
+    .sort((a, b) => (a.x - b.x) || (a.z - b.z));
+  const uniq = [];
+  for (const p of sorted) {
+    const last = uniq[uniq.length - 1];
+    if (!last || Math.abs(last.x - p.x) > 1e-6 || Math.abs(last.z - p.z) > 1e-6) uniq.push(p);
+  }
+  if (uniq.length < 3) return uniq;
+  const cross = (o, a, b) => (a.x - o.x) * (b.z - o.z) - (a.z - o.z) * (b.x - o.x);
+  const lower = [];
+  for (const p of uniq) {
+    while (lower.length >= 2 && cross(lower[lower.length - 2], lower[lower.length - 1], p) <= 0) lower.pop();
+    lower.push(p);
+  }
+  const upper = [];
+  for (let i = uniq.length - 1; i >= 0; i--) {
+    const p = uniq[i];
+    while (upper.length >= 2 && cross(upper[upper.length - 2], upper[upper.length - 1], p) <= 0) upper.pop();
+    upper.push(p);
+  }
+  lower.pop(); upper.pop();
+  return lower.concat(upper);
+};
+
+const distToSegmentXZ = (px, pz, a, b) => {
+  const dx = b.x - a.x, dz = b.z - a.z;
+  const len2 = dx * dx + dz * dz;
+  if (len2 < 1e-12) return Math.hypot(px - a.x, pz - a.z);
+  let t = ((px - a.x) * dx + (pz - a.z) * dz) / len2;
+  t = Math.max(0, Math.min(1, t));
+  return Math.hypot(px - (a.x + t * dx), pz - (a.z + t * dz));
 };
 
 const qConj = (q) => ({ x: -q.x, y: -q.y, z: -q.z, w: q.w });
@@ -162,9 +230,8 @@ const extractRebarForHole = (rebars, cx, cz, rx, rz) => {
 };
 
 // Build the 3D rectangular rebar lattice for one slab tile (tile-local coords).
-// Real reinforced-concrete slabs are NOT a single mid-plane grid — they carry several stacked
-// X–Z mats (typically top + bottom + inner layers) tied together by vertical stirrups at every
-// grid intersection, forming a rectangular endo-skeleton through the slab thickness.
+// `nLayers` planar X–Z grids sit at `rebarCover` inset from the top/bottom major faces; vertical
+// stirrups at every grid node tie the mats into a cage. Grid pitch = `rebarSpacing` (300 mm default).
 const buildSlabRebarLattice = (tileHalf, slabThickness, opts) => {
   const th = opts.rebarThickness;
   const nLayers = Math.max(1, Math.round(opts.rebarLayers ?? 1));
@@ -239,6 +306,7 @@ export class RubbleSim {
     this.onRemove = callbacks.onRemove || (() => {});
     this.onReshape = callbacks.onReshape || (() => {}); // renderer rebuilds a part's mesh after a hole is cut
     this.onExpose = callbacks.onExpose || (() => {});   // renderer skins concrete when rebar is revealed
+    this.onSplinter = callbacks.onSplinter || (() => {}); // visual-only cement chips at a fracture
     this.phase = 'idle';
     this._init();
   }
@@ -248,20 +316,28 @@ export class RubbleSim {
     this.world = new R.World({ x: 0, y: -this.opts.gravity, z: 0 });
     this.world.integrationParameters.dt = 1 / 120;
     if ('numSolverIterations' in this.world.integrationParameters) {
-      this.world.integrationParameters.numSolverIterations = 12; // steadier joint networks
+      this.world.integrationParameters.numSolverIterations = 16; // steadier contacts / friction
     }
     this.events = new R.EventQueue(true);
+    // Fixed rigid body for the ground (not a lone collider). Character controllers and
+    // castRay queries latch onto this reliably; a parentless collider was letting the
+    // rescuer capsule drift / fail computedGrounded().
+    const groundBody = this.world.createRigidBody(R.RigidBodyDesc.fixed().setTranslation(0, -0.5, 0));
     this.world.createCollider(
-      R.ColliderDesc.cuboid(100, 0.5, 100).setTranslation(0, -0.5, 0)
-        .setRestitution(0).setFriction(this.opts.friction)
+      R.ColliderDesc.cuboid(100, 0.5, 100)
+        .setRestitution(0).setFriction(this.opts.friction),
+      groundBody,
     );
+    this.groundBody = groundBody;
     this.parts = [];
     this.members = [];
     this.floors = [];        // per storey: {story, tiles[i][j], slabY, tileHalf}
     this.joints = [];        // records: {joint, a, b, type:'member'|'tie', breakAngle, member?, broken}
     this.colliderToPart = new Map();
     this.rng = makeRng(this.opts.seed);
-    this.stats = { snaps: 0, cracks: 0, tears: 0, cuts: 0, maxForce: 0, maxBend: 0 };
+    // `yields` counts ties that gave way under SUSTAINED load rather than impact (see _yieldTiesOf).
+    this.stats = { snaps: 0, cracks: 0, tears: 0, cuts: 0, yields: 0, maxForce: 0, maxBend: 0 };
+    this.dustQueue = [];
   }
 
   clear() { for (const p of this.parts) this.onRemove(p); this.world.free(); this.events.free(); this._init(); }
@@ -278,13 +354,26 @@ export class RubbleSim {
       .setLinearDamping(this.opts.linearDamping)
       .setAngularDamping(this.opts.angularDamping)
       .setCcdEnabled(true);
+    // NOTE: do NOT disable sleeping here. Every structural piece is built `fixed: true` and only
+    // becomes dynamic in collapse(), so the guard never fired anyway — and a body created with
+    // canSleep=false ignores sleep(), which breaks the soft freeze. Pieces sleep normally; the
+    // equilibrium check wakes the ones that should still be moving.
     if (rot) bd.setRotation(rot);
     const body = this.world.createRigidBody(bd);
+    const mu = matKind === 'furniture'
+      ? (this.opts.frictionFurniture ?? 0.35)
+      : this.opts.friction;
     let cd = R.ColliderDesc.cuboid(shape.hx, shape.hy, shape.hz)
-      .setRestitution(this.opts.restitution).setFriction(this.opts.friction).setDensity(density);
+      .setRestitution(this.opts.restitution)
+      .setFriction(mu)
+      .setDensity(density);
+    // Min combine: a low-μ partner (furniture / dusty face) actually reduces grip.
+    if (typeof cd.setFrictionCombineRule === 'function' && R.CoefficientCombineRule) {
+      cd = cd.setFrictionCombineRule(R.CoefficientCombineRule.Min);
+    }
     if (events) cd = cd.setActiveEvents(R.ActiveEvents.CONTACT_FORCE_EVENTS).setContactForceEventThreshold(this.opts.contactEventThreshold);
     const col = this.world.createCollider(cd, body);
-    const part = { body, col, colliders: [col], shape, matKind, kind: matKind, fixed, member, rebars };
+    const part = { body, col, colliders: [col], shape, matKind, kind: matKind, fixed, member, rebars, friction: mu };
     this.parts.push(part);
     this.colliderToPart.set(col.handle, part);
     this.onAdd(part);
@@ -323,9 +412,63 @@ export class RubbleSim {
     // the fracture opens the concrete — reveal the lattice on both sides of the seam
     this._exposeRebar(rec.a);
     this._exposeRebar(rec.b);
+    if (rec.type === 'tie' && (this.opts.splinterOnCrack ?? 0) > 0) {
+      this._spawnSplinters(rec, { chips: this.opts.splinterOnCrack, scaleMul: 0.55 });
+    }
   }
 
   _crackTie(rec) { this._crackJoint(rec, rec.hingeAxis); }
+
+  /** Weaker concrete → more pulverised fines for the same impact energy. */
+  _dustMul() {
+    const fc = Math.max(5e3, this.opts.concreteFc);
+    return this.opts.concreteFcRef / fc;
+  }
+
+  _emitDust(x, y, z, count, spread = 0.8) {
+    if (count <= 0) return;
+    this.dustQueue.push({ x, y, z, count, spread: spread * this._dustMul() });
+  }
+
+  drainDustEvents() {
+    const q = this.dustQueue;
+    this.dustQueue = [];
+    return q;
+  }
+
+  _jointWorldMid(rec) {
+    const pa = rec.a.body.translation(), pb = rec.b.body.translation();
+    return { x: (pa.x + pb.x) / 2, y: (pa.y + pb.y) / 2, z: (pa.z + pb.z) / 2 };
+  }
+
+  // Cover spalls and aggregate chips at a fracture — visual-only (no colliders: chips must not
+  // pollute the contact graph or blow up lifting-bag interfaces).
+  _spawnSplinters(rec, { chips, scaleMul = 1 } = {}) {
+    const o = this.opts;
+    const n = chips ?? o.splinterChips ?? 0;
+    if (n <= 0) return;
+    const mid = this._jointWorldMid(rec);
+    const parent = rec.a;
+    const cross = Math.min(parent.shape.hx, parent.shape.hy, parent.shape.hz) * 2;
+    const base = cross * (o.splinterScale ?? 0.22) * scaleMul;
+    const out = [];
+    for (let i = 0; i < n; i++) {
+      const s = base * this.rng.float(0.35, 1.0);
+      out.push({
+        x: mid.x + this.rng.float(-0.2, 0.2),
+        y: mid.y + this.rng.float(-0.08, 0.18),
+        z: mid.z + this.rng.float(-0.2, 0.2),
+        hx: Math.max(0.05, s * this.rng.float(0.25, 0.75)),
+        hy: Math.max(0.04, s * this.rng.float(0.25, 0.75)),
+        hz: Math.max(0.05, s * this.rng.float(0.25, 0.75)),
+        rx: this.rng.float(0, Math.PI),
+        ry: this.rng.float(0, Math.PI),
+        rz: this.rng.float(0, Math.PI),
+      });
+    }
+    this.onSplinter(out, rec.a);
+    this._emitDust(mid.x, mid.y, mid.z, Math.ceil(n * 4 * this._dustMul()), 0.6);
+  }
 
   // stiff linear member (column/beam): chain of box segments held by snap-able fixed joints
   _member(kind, from, to, cross, nSeg, density, withRebar) {
@@ -499,6 +642,9 @@ export class RubbleSim {
       p.body.setBodyType(R.RigidBodyType.Dynamic, true); p.body.wakeUp(); p.fixed = false;
       p.body.setLinvel({ x: this.rng.float(-0.5, 0.5), y: 0, z: this.rng.float(-0.5, 0.5) }, true);
     }
+    // Initial collapse throws up a cloud of cement fines (poor mix → more dust).
+    const burst = Math.round((o.dustCollapseBurst ?? 80) * this._dustMul());
+    this._emitDust(0, o.stories * o.storyHeight * 0.45, 0, burst, 2.5);
     this.phase = 'collapsing';
   }
 
@@ -521,6 +667,13 @@ export class RubbleSim {
       this._processContacts();
     }
     this._processSnaps();
+    // Periodically re-check resting pieces: anything floating, tipping or sliding is woken so
+    // gravity finishes the job here, during the collapse, instead of at freeze time.
+    this._enforceLimits();
+    this._frameNo = (this._frameNo || 0) + 1;
+    if (this._frameNo % (this.opts.restWindowFrames ?? 30) === 0) this._sampleDrift();
+    const every = this.opts.equilibriumEveryNFrames ?? 10;
+    if (every > 0 && this._frameNo % every === 0) this._wakeUnstable();
     if (this.rescue) this.rescue.postStep();
   }
 
@@ -533,6 +686,16 @@ export class RubbleSim {
       if (!p || p.dead) return;
       if ((p.kind === 'beam' || p.kind === 'column') && p.member && mag > o.beamSnapForce) this._snapMember(p.member);
       else if (p.kind === 'slab' && mag > o.slabCrackForce) this._crackTilesOf(p);
+      const dustTh = o.dustContactForce ?? 400;
+      if (mag > dustTh) {
+        const c1 = e.collider1(), c2 = e.collider2();
+        const p1 = this.colliderToPart.get(c1), p2 = this.colliderToPart.get(c2);
+        if (p1 && p2 && !p1.dead && !p2.dead) {
+          const t1 = p1.body.translation(), t2 = p2.body.translation();
+          const n = Math.ceil((mag - dustTh) / 180 * this._dustMul());
+          this._emitDust((t1.x + t2.x) / 2, (t1.y + t2.y) / 2, (t1.z + t2.z) / 2, Math.min(n, 12), 0.5);
+        }
+      }
     });
   }
 
@@ -574,17 +737,449 @@ export class RubbleSim {
     // snapped / torn members expose their cage like broken bones
     this._exposeRebar(rec.a);
     this._exposeRebar(rec.b);
+    if (rec.type === 'member') this._spawnSplinters(rec);
+  }
+
+  // ---- equilibrium of a resting piece (contact-based) -----------------------------
+  //
+  // A piece is in equilibrium when it (a) actually touches something that pushes back,
+  // (b) has its centre of gravity over the polygon of load-bearing contacts, and (c) sits on a
+  // plane no steeper than Coulomb friction can hold. All three come from Rapier's narrow phase
+  // — real contact points, normals and solver impulses — because in a rubble pile most load
+  // paths run through wedged and leaning faces that a downward raycast never sees.
+
+  _centreOfMass(part) {
+    const b = part.body;
+    if (typeof b.worldCom === 'function') {
+      const c = b.worldCom();
+      if (c) return c;
+    }
+    return b.translation();
   }
 
   /**
-   * Settle the pile.
+   * World contacts acting on `part`, with the normal flipped so it always points the way the
+   * OTHER body pushes this one (the sign is derived geometrically rather than assumed).
    *
-   * By default this is a SOFT freeze: bodies stay Dynamic and are put to SLEEP. Sleeping bodies
-   * cost almost nothing to simulate but keep their contact manifolds and normal impulses alive,
-   * so the settled rubble still has real load paths that DebrisSupport / the stress map / lifting
-   * bags / shoring can read. Converting everything to Fixed — which this used to do — zeroes
-   * every contact force and makes the settled pile kinematically fake: no weight bears on
-   * anything, so "how much is on top of this slab?" has no answer.
+   * Two Rapier details matter here. Contact points live in each collider's LOCAL frame, and the
+   * manifold keeps its own collider order — `flipped` says ours is the second one. And impulses
+   * are indexed by CONTACT, not by solver contact: `numSolverContacts()` is often smaller than
+   * `numContacts()`, so walking the solver list silently drops load-bearing contacts.
+   */
+  _contactsOf(part) {
+    const out = [];
+    const np = this.world.narrowPhase;
+    const com = this._centreOfMass(part);
+    for (const col of (part.colliders || [part.col])) {
+      if (!col) continue;
+      const ct = col.translation();
+      const cr = col.rotation();
+      const myMu = col.friction();
+      this.world.contactPairsWith(col, (other) => {
+        // Colliders are built with the Min combine rule, so the pair's μ is the smaller of the two.
+        const mu = Math.min(myMu, other.friction());
+        np.contactPair(col.handle, other.handle, (man, flipped) => {
+          const n = man.normal();
+          const count = man.numContacts();
+          for (let i = 0; i < count; i++) {
+            const lp = flipped ? man.localContactPoint2(i) : man.localContactPoint1(i);
+            if (!lp) continue;
+            const w = rotateVec(cr, lp);
+            const x = ct.x + w.x;
+            const y = ct.y + w.y;
+            const z = ct.z + w.z;
+            const toCom = (com.x - x) * n.x + (com.y - y) * n.y + (com.z - z) * n.z;
+            const s = toCom < 0 ? -1 : 1;
+            out.push({
+              x, y, z,
+              nx: n.x * s, ny: n.y * s, nz: n.z * s,
+              imp: man.contactImpulse(i),
+              mu,
+            });
+          }
+        });
+      });
+    }
+    return out;
+  }
+
+  /**
+   * Signed horizontal distance from (cx,cz) to the support polygon: positive inside, negative
+   * outside. Degenerate footprints — a single contact point, or a knife edge — are measured as
+   * point / segment distance, which is what makes "balanced on a corner" come out negative.
+   */
+  _supportMargin(bearing, cx, cz) {
+    const hull = convexHullXZ(bearing);
+    if (!hull.length) return -Infinity;
+    if (hull.length === 1) return -Math.hypot(cx - hull[0].x, cz - hull[0].z);
+    if (hull.length === 2) return -distToSegmentXZ(cx, cz, hull[0], hull[1]);
+    let inside = true;
+    let nearest = Infinity;
+    for (let i = 0; i < hull.length; i++) {
+      const a = hull[i];
+      const b = hull[(i + 1) % hull.length];
+      // Hull is counter-clockwise, so an interior point lies left of every edge.
+      if ((b.x - a.x) * (cz - a.z) - (b.z - a.z) * (cx - a.x) < 0) inside = false;
+      nearest = Math.min(nearest, distToSegmentXZ(cx, cz, a, b));
+    }
+    return inside ? nearest : -nearest;
+  }
+
+  /** How many unbroken rebar ties still hold this piece. */
+  _tieCount(part) {
+    let n = 0;
+    for (const j of this.joints) {
+      if (!j.broken && (j.a === part || j.b === part)) n++;
+    }
+    return n;
+  }
+
+  /**
+   * Why a piece that has come to rest is (or is not) in equilibrium:
+   *   moving      — still in motion; equilibrium is only a statement about pieces at rest
+   *   unsupported — nothing pushes back hard enough to carry its weight: it is floating
+   *   hanging     — no contact carries it; the rebar does. Real for a tied panel off the pile edge
+   *   wedged      — carried by side contacts (arching / friction against a face): legitimate
+   *   loaded      — tied into the pile or carrying debris from above, so its weight is not the
+   *                 only force acting. Rapier does not expose joint impulses and we cannot see
+   *                 the neighbours' load lines, so a centre-of-gravity test would be meaningless
+   *                 here — the solver's own force balance is the authority.
+   *   tipping     — free-standing, CoG outside the load-bearing footprint: gravity has a lever arm
+   *   slipping    — free-standing on a plane steeper than atan(μ): friction cannot hold it
+   */
+  _equilibriumOf(part) {
+    if (part.dead || part.fixed) return { ok: true, state: 'fixed' };
+    if (!this._atRest(part)) return { ok: true, state: 'moving' };
+    const o = this.opts;
+    const contacts = this._contactsOf(part);
+    const ties = this._tieCount(part);
+    // Impulse a resting piece needs each solver step just to hold its own weight — the yardstick
+    // every measured contact impulse is compared against (impulse = force × timestep).
+    const weightImpulse = part.body.mass() * (o.gravity ?? 9.81) * this.world.timestep;
+
+    const eps = o.supportImpulseMin ?? 1e-5;
+    const minY = o.supportNormalMinY ?? 0.15;
+    const bearing = [];
+    let live = 0;       // contacts actually transmitting force (touching, not merely nearby)
+    let lift = 0;       // upward impulse the pile gives back to this piece
+    let external = 0;   // everything else pressing on it: debris above, neighbours propping it
+    let down = 0;       // of that, the part actually pressing DOWN — surcharge the ties must carry
+    for (const c of contacts) {
+      if (c.imp <= eps) continue;
+      live++;
+      if (c.ny > minY) { bearing.push(c); lift += c.imp * c.ny; }
+      else {
+        external += c.imp;
+        if (c.ny < 0) down += c.imp * -c.ny;
+      }
+    }
+    // Impulses are per-step; force = impulse / timestep. Net extra load the ties see is whatever
+    // presses down minus whatever the pile still gives back.
+    const surcharge = Math.max(0, (down - lift) / this.world.timestep);
+
+    // Nothing transmits force to it at all: either the rebar carries it (a tied panel hanging off
+    // the pile is real, and shows up in the census so it can be eyeballed) or it is simply floating.
+    if (!live) {
+      return {
+        ok: ties > 0, state: ties > 0 ? 'hanging' : 'unsupported',
+        contacts: contacts.length, ties, tieBorne: ties > 0, surcharge: 0,
+      };
+    }
+
+    // Nothing underneath it. That can still be legitimate — arching debris is held by friction on
+    // near-vertical faces — but only if that friction can take the weight: Σ μ·N is the most
+    // tangential force the contacts could ever supply (Coulomb's limit).
+    const need = (o.minReactionFrac ?? 0.3) * weightImpulse;
+    if (!bearing.length) {
+      // Held by rebar with nothing underneath, but with debris on its back: the ties carry its
+      // weight AND the surcharge, so this is the case the yield check most needs to see.
+      if (ties > 0) {
+        return { ok: true, state: 'loaded', contacts: contacts.length, ties, tieBorne: true, surcharge };
+      }
+      let grip = 0;
+      for (const c of contacts) if (c.imp > eps) grip += c.mu * c.imp;
+      const state = grip >= need ? 'wedged' : 'unsupported';
+      return { ok: state === 'wedged', state, contacts: contacts.length, ties, lift, grip };
+    }
+
+    // Tip / slip only mean something for a piece whose own weight is the only load on it. Debris
+    // stacked on top, a neighbour propping it sideways or a rebar tie all put forces on it whose
+    // lines of action we cannot see (Rapier exposes no joint impulses), and any of them can hold
+    // a pose that a free body could not. For those the solver's force balance is the authority.
+    if (ties > 0 || external > (o.freeLoadFrac ?? 0.25) * weightImpulse) {
+      return { ok: true, state: 'loaded', contacts: contacts.length, ties, external, lift };
+    }
+
+    const com = this._centreOfMass(part);
+    const margin = this._supportMargin(bearing, com.x, com.z);
+    const tipping = margin < -(o.tipMargin ?? 0.03);
+
+    // Impulse-weighted support plane: tan(α) > μ is the block-on-an-incline slip condition.
+    let sx = 0, sy = 0, sz = 0, mu = Infinity;
+    for (const c of bearing) {
+      const w = Math.max(c.imp, 1e-9);
+      sx += c.nx * w; sy += c.ny * w; sz += c.nz * w;
+      if (c.mu > 0 && c.mu < mu) mu = c.mu;
+    }
+    const len = Math.hypot(sx, sy, sz) || 1;
+    const incline = Math.acos(Math.max(-1, Math.min(1, Math.abs(sy / len))));
+    if (!Number.isFinite(mu)) mu = part.friction ?? o.friction;
+    let slipping = Math.tan(incline) > mu + (o.slipMargin ?? 0.05);
+    if (slipping) {
+      // A piece pinched between two steep faces reads as "on a steep plane" but is really held by
+      // friction from both sides. Coulomb's limit decides: can Σ μ·N carry the weight the normal
+      // reactions do not? (On a genuine ramp it cannot — that is exactly tan α > μ.)
+      let grip = 0;
+      for (const c of contacts) if (c.imp > eps) grip += c.mu * c.imp;
+      if (grip >= Math.max(0, weightImpulse - lift)) {
+        return { ok: true, state: 'wedged', contacts: contacts.length, ties, lift, grip };
+      }
+    }
+
+    return {
+      ok: !tipping && !slipping,
+      // Slip is reported first: on a face steeper than the friction angle the piece is going
+      // regardless of where its footprint is.
+      state: slipping ? 'slipping' : tipping ? 'tipping' : 'stable',
+      margin, incline, mu, contacts: contacts.length, bearing: bearing.length, ties,
+    };
+  }
+
+  /**
+   * Keep the simulation inside physical bounds, once per frame.
+   *
+   * Two artifacts need this. A fragment pinched between a lifting bag and the slab it is jacking
+   * can be penetrating deeply enough that the solver's recovery flings it at hundreds of m/s —
+   * nothing in a three-storey collapse can fall faster than about 20 m/s, so anything beyond that
+   * is numerical, not physical. And a piece squeezed through the floor would otherwise fall for
+   * ever, dragging the scene's coordinates to millions of metres; it has left the simulation.
+   */
+  _enforceLimits() {
+    const o = this.opts;
+    const vMax = o.maxDebrisSpeed ?? 25;
+    const wMax = o.maxDebrisSpin ?? 25;
+    const floor = o.killPlaneY ?? -1.5;
+    for (const p of [...this.parts]) {
+      if (p.dead) continue;
+      const body = p.body;
+      if (body.translation().y < floor) { this._removePart(p); continue; }
+      if (p.fixed || body.isSleeping()) continue;
+      const v = body.linvel();
+      const speed = Math.hypot(v.x, v.y, v.z);
+      if (speed > vMax) {
+        const k = vMax / speed;
+        body.setLinvel({ x: v.x * k, y: v.y * k, z: v.z * k }, true);
+      }
+      const w = body.angvel();
+      const spin = Math.hypot(w.x, w.y, w.z);
+      if (spin > wMax) {
+        const k = wMax / spin;
+        body.setAngvel({ x: w.x * k, y: w.y * k, z: w.z * k }, true);
+      }
+    }
+  }
+
+  /** Record how far every piece travelled since the previous sample (see `restWindowFrames`). */
+  _sampleDrift() {
+    for (const p of this.parts) {
+      if (p.dead) continue;
+      const t = p.body.translation();
+      const prev = p.restSample;
+      if (prev) {
+        p.drift = Math.hypot(t.x - prev.x, t.y - prev.y, t.z - prev.z);
+        // It moved, so any earlier "waking this achieves nothing" verdict no longer applies.
+        if (p.drift > (this.opts.restDrift ?? 0.03)) p.eqWakes = 0;
+      }
+      p.restSample = { x: t.x, y: t.y, z: t.z };
+    }
+  }
+
+  /** Effectively at rest — asleep, or not actually going anywhere. */
+  _atRest(part) {
+    if (part.body.isSleeping()) return true;
+    const o = this.opts;
+    const v = part.body.linvel();
+    const speed = Math.hypot(v.x, v.y, v.z);
+    if (part.drift != null) {
+      return part.drift <= (o.restDrift ?? 0.03) && speed <= (o.restSpeedCap ?? 1.0);
+    }
+    const w = part.body.angvel();
+    return speed <= (o.restLinVel ?? 0.05)
+      && Math.hypot(w.x, w.y, w.z) <= (o.restAngVel ?? 0.15);
+  }
+
+  /**
+   * Census of the pile. `failing` counts pieces that physics says should still be moving
+   * (floating, tipping or sliding) — a settled pile reads zero.
+   */
+  equilibriumReport({ samples = 0 } = {}) {
+    const counts = {
+      total: 0, stable: 0, hanging: 0, wedged: 0, loaded: 0,
+      unsupported: 0, tipping: 0, slipping: 0, failing: 0, moving: 0,
+    };
+    const worst = [];
+    for (const p of this.parts) {
+      if (p.dead || p.fixed) continue;
+      counts.total++;
+      if (!this._atRest(p)) counts.moving++;
+      const eq = this._equilibriumOf(p);
+      if (counts[eq.state] !== undefined) counts[eq.state]++;
+      if (!eq.ok) {
+        counts.failing++;
+        if (worst.length < samples) {
+          worst.push({
+            kind: p.kind,
+            state: eq.state,
+            y: +p.body.translation().y.toFixed(2),
+            margin: eq.margin != null && Number.isFinite(eq.margin) ? +eq.margin.toFixed(3) : null,
+            inclineDeg: eq.incline != null ? Math.round((eq.incline * 180) / Math.PI) : null,
+          });
+        }
+      }
+    }
+    return { ...counts, worst };
+  }
+
+  /**
+   * Safe to stop here: nothing is going anywhere and nothing is hanging in mid-air. Pieces in a
+   * questionable-but-held pose are reported by `equilibriumReport` rather than blocking the
+   * freeze for ever — the solver is entitled to hold a load path we cannot fully see.
+   */
+  isSettled() {
+    for (const p of this.parts) {
+      if (p.dead || p.fixed) continue;
+      if (!this._atRest(p)) return false;
+    }
+    return this.equilibriumReport().unsupported === 0;
+  }
+
+  /**
+   * Cracking moment of a piece's weakest bending axis, in kN·m. Plain concrete's modulus of
+   * rupture is about 0.33·√f'c (MPa) — this is what a slab seam can carry in bending before it
+   * cracks through and leaves only the bars.
+   *
+   * The mean rupture modulus is optimistic for a seam in a collapsed building: unreinforced
+   * concrete in flexure is brittle and scatters badly, which is why codes derate it (ACI 318 uses
+   * φ ≈ 0.60 for plain concrete), and these seams have already been slammed around. `plainConcretePhi`
+   * is that reduction — raising it towards 1 makes debris hang on intact seams more readily.
+   */
+  _crackingMoment(part) {
+    const o = this.opts;
+    if (!part.shape) return Infinity;
+    const { hx, hy, hz } = part.shape;
+    // Bending across the thinnest dimension is the weakest way to break it: Z = w·h²/6.
+    const [h, w] = [hx * 2, hy * 2, hz * 2].sort((a, b) => a - b);
+    const fctKPa = (o.flexuralStrengthCoef ?? 0.33) * Math.sqrt((o.concreteFc ?? 17e3) / 1000) * 1000;
+    return (o.plainConcretePhi ?? 0.6) * fctKPa * (w * h * h) / 6;
+  }
+
+  /** Tension the bars crossing a seam can carry before they yield, in kN. */
+  _tieBarCapacity(part) {
+    const o = this.opts;
+    if (!part.shape) return Infinity;
+    const { hx, hy, hz } = part.shape;
+    const seam = [hx * 2, hy * 2, hz * 2].sort((a, b) => a - b)[1];
+    const bars = Math.max(2, Math.round(seam / (o.rebarSpacing ?? 0.3)) * (o.rebarLayers ?? 2));
+    const area = Math.PI * (o.rebarThickness ?? 0.008) ** 2;
+    return (o.steelFy ?? 415e3) * bars * area;
+  }
+
+  /**
+   * A piece with nothing under it puts its whole weight on its ties — and because gravity acts
+   * through the centre of gravity, a tie offset horizontally from it carries that weight as
+   * BENDING. A fixed weld does not care, which is why tied debris could hang rigidly in mid-air
+   * with no sag at all. Past the seam's cracking moment the weld becomes a rebar hinge and the
+   * piece rotates down; past the bars' yield it separates. Only sustained load counts: pieces
+   * still in motion are never evaluated (see `_equilibriumOf`).
+   *
+   * `surchargeKN` is debris weighing down on the piece, which the ties carry just as much as its
+   * own weight — a bare panel dangling off the pile is usually within capacity, and it is the one
+   * with a slab lying across it that tears its rebar.
+   */
+  _yieldTiesOf(part, surchargeKN = 0) {
+    const ties = this.joints.filter((j) => !j.broken && !j.a.dead && !j.b.dead
+      && (j.a === part || j.b === part));
+    if (!ties.length) return 0;
+    const weight = part.body.mass() * (this.opts.gravity ?? 9.81);   // tonnes·m/s² = kN
+    const share = (weight + Math.max(0, surchargeKN)) / ties.length;
+    const com = this._centreOfMass(part);
+    const mCr = this._crackingMoment(part);
+    const tCap = this._tieBarCapacity(part);
+    let yielded = 0;
+    for (const rec of ties) {
+      const other = rec.a === part ? rec.b : rec.a;
+      const local = rec.a === part ? rec.anchorB : rec.anchorA;
+      const t = other.body.translation();
+      const r = rotateVec(other.body.rotation(), local);
+      const lever = Math.hypot(com.x - (t.x + r.x), com.z - (t.z + r.z));
+      const moment = share * lever;
+      if (rec.type === 'tie' && !rec.cracked) {
+        if (moment > mCr) {
+          this._crackJoint(rec, rec.hingeAxis || { x: 1, y: 0, z: 0 });
+          this.stats.yields++;
+          yielded++;
+        }
+      } else if (share > tCap || moment > mCr) {
+        this.stats.yields++;
+        // A hinge (or a member weld, which has no hinge state) has nothing left to give but rupture.
+        this._breakJoint(rec);
+        yielded++;
+      }
+    }
+    if (yielded) part.body.wakeUp();
+    return yielded;
+  }
+
+  /**
+   * One sweep over the resting pile. Pieces that should not be resting are woken — no impulses,
+   * no culling — and sleeping bodies keep their contact manifolds, so a piece that dozed off
+   * balanced on a corner is caught here and tips over on its own. Waking is capped per piece: if
+   * three attempts change nothing the solver really is holding it, and shaking it again would be
+   * theatre rather than physics. Any piece whose weight is carried by rebar rather than by
+   * something underneath it gets the sustained-load check above.
+   */
+  _wakeUnstable() {
+    const cap = this.opts.maxWakeAttempts ?? 3;
+    let woken = 0;
+    for (const p of [...this.parts]) {
+      if (p.dead || p.fixed) continue;
+      const eq = this._equilibriumOf(p);
+      if (eq.tieBorne) this._yieldTiesOf(p, eq.surcharge);
+      if (!p.body.isSleeping()) continue;
+      if (eq.ok) { p.eqWakes = 0; continue; }
+      if ((p.eqWakes || 0) >= cap) continue;
+      p.eqWakes = (p.eqWakes || 0) + 1;
+      p.body.wakeUp();
+      woken++;
+    }
+    return woken;
+  }
+
+  /**
+   * Keep running the ordinary collapse until the pile is in equilibrium. This is the SAME
+   * simulation the renderer already drives — no second pass, no teleporting — so it cannot
+   * produce a visible "second collapse".
+   */
+  settleToEquilibrium(maxSeconds = 12) {
+    if (this.phase !== 'collapsing') return this.isSettled();
+    const frames = Math.round(maxSeconds * 60);
+    for (let f = 0; f < frames; f++) {
+      this.step();
+      if (f > 30 && f % 10 === 0 && this.isSettled()) break;
+    }
+    return this.isSettled();
+  }
+
+  /**
+   * Stop the pile where it stands.
+   *
+   * SOFT freeze (default): bodies stay Dynamic and are put to SLEEP. Sleeping bodies cost almost
+   * nothing but keep their contact manifolds and normal impulses, so settled rubble still has
+   * real load paths for DebrisSupport / the stress map / lifting bags / shoring.
+   *
+   * Freezing does NOT re-simulate, break joints or delete debris — doing that here produced a
+   * visible second collapse. Equilibrium is reached during the collapse phase instead (see
+   * `settleToEquilibrium` / `_wakeUnstable`); this is purely "stop here".
    *
    * Pass {hard:true} for a genuinely immovable pile.
    */
@@ -604,6 +1199,8 @@ export class RubbleSim {
     }
     this.hardFrozen = hard;
     this.phase = 'frozen';
+    // Census of what we froze — surfaced in the HUD and asserted headlessly.
+    this.equilibrium = hard ? null : this.equilibriumReport({ samples: 5 });
     if (this.support && !hard) this.support.rebuild();
   }
 
@@ -723,9 +1320,8 @@ export class RubbleSim {
     let woken = 0;
     for (const p of this.parts) {
       if (p.dead) continue;
-      // Never wake shoring: a shore that gets converted to a falling body is not shoring. It
-      // stays Fixed until it is overloaded, which is RescueOps.measureShores's call to make.
-      if (p.shore) continue;
+      // Never wake shoring / ladders / agents: converting them to falling bodies breaks rescue kit.
+      if (p.shore || p.ladder || p.agent || p.rescuer || p.victim) continue;
       const t = p.body.translation();
       if (Math.hypot(t.x - point.x, t.y - point.y, t.z - point.z) <= radius) {
         p.body.setBodyType(R.RigidBodyType.Dynamic, true); p.body.wakeUp(); p.fixed = false; woken++;

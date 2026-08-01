@@ -23,6 +23,14 @@ console.log('collapsed:', await page.evaluate(() => document.getElementById('sta
 const ring = await page.evaluate(() => window.__app.toolRing());
 console.log(`tool ring: ${ring.length} entries — ${ring.map((r) => r.tool).join(', ')}`);
 
+// Equipment is locked until somebody is on site to carry it (DEVLOG 2026-08-01), so nothing below
+// this line can select a tool without a rescuer. shoot-tooling.mjs is the driver that tests the
+// lock itself; here we just unlock and get on with the §4 UI.
+const lockedRing = await page.evaluate(() => window.__app.toolRingDisabled());
+console.log(`tool ring before a rescuer exists: ${lockedRing} of ${ring.length} buttons disabled`);
+await page.evaluate(() => { window.__app.spawnRescuer(); window.__app.params.rescuerMode = false; });
+await page.waitForTimeout(300);
+
 // keyboard selection must drive the same global state the ring shows
 await page.keyboard.press('4');
 const afterKey = await page.evaluate(() => ({ tool: window.__app.activeTool(), ring: window.__app.toolRing() }));

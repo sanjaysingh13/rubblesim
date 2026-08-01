@@ -411,6 +411,99 @@ reinforcement became a 3D cage, and its visibility became an *event*, not a cons
   iteration 12, and `rebarExposed` being false. Before debugging a missing cage, check which —
   "no steel on an intact building" is now the correct behaviour.
 
+## Iteration 14 — poor-site concrete, splinters, dust, and lattice tuning
+
+Driven by USAR feedback and on-site reality: **most builders skimp on cement**, slabs splinter
+and spall more than the nominal-mix defaults suggested, and a collapse throws up a **cement-dust
+haze**. The sim now treats weak mix as the default, not an edge case.
+
+### Rebar lattice specs (user-facing RC defaults)
+Iteration 13's cage was retuned to match real light-floor reinforcement rather than a dense
+research grid:
+- **`rebarLayers` 4 → 2** — top + bottom mat only (still tunable 1–6 in GUI).
+- **`rebarCover` 0.040 m** — each mat sits 40 mm in from the slab's major (top/bottom) face.
+- **`rebarSpacing` 0.30 m** — 300 mm square grid pitch (~7×7 lines per ~2 m tile).
+- Rod radius stays **0.008 m** (~16 mm bars). GUI folder renamed **"Rebar lattice"** with
+  spacing range 0.15–0.50 m and **"cover from face (m)"**.
+
+At these defaults a tile carries far fewer rods than iteration 13's 609/tile figure — the cage
+reads as a real mat, not a solid red mesh.
+
+### Skinned concrete — fixing the "red wash"
+First skinned build made the whole pile look like rust: rebar drew through translucent shells
+at ~36% opacity while **every** slab was mass-exposed on `collapse()`, and rebar child meshes
+were always visible under opaque concrete until exposure fired.
+
+Fixes:
+- Rebar meshes stay **`visible = false`** until `_exposeRebar` / `onExpose`.
+- Skinned opacity **0.36 → 0.65–0.70**, `depthWrite: true` — grey concrete dominates, steel
+  is a hint inside fractures.
+- Removed mass slab expose on `collapse()`; steel appears at **cracks, snaps, cuts, spalls**
+  only (measured ~30/177 parts exposed post-collapse, not 36/36 tiles).
+- Rebar tint **0x904428**, lower metalness — at high rod counts the old rust read as a surface.
+
+### Poor-site concrete is now the DEFAULT
+No separate "cement:sand ratio" param — **`concreteFc` (17 MPa)** is the single engineering
+proxy for under-cemented, high-sand site mix. Nominal design mix is **25 MPa** (`concreteFcRef`,
+used only for dust/spall scaling).
+
+| Param | Nominal (iter 12) | Default now |
+|-------|-------------------|-------------|
+| `concreteFc` | 25 MPa | **17 MPa** |
+| `beamSegments` / `colSegments` | 3 / 3 | **6 / 5** |
+| `maxBreaksPerMember` | 1 | **2** (up to 3 lengths per member) |
+| `beamSnapForce` | 1150 kN | **950 kN** |
+| `spallOnCut` | 0.35 | **0.48** |
+
+Measured on seed 1: **~39 member snaps** vs ~7 at nominal mix; **~270–280 settled parts** vs
+~177 (more segments + splinter geometry). Collapse still passes `verify.mjs` (no explosion,
+buried voids). Weaker `f'c` makes crush govern sooner in `FrameModel` — columns fail earlier in
+the cascade, which matches the intended "skimped mix" story.
+
+### Splintering (visual-only cement chips)
+Beam/column snaps spawn **`splinterChips` (2)** grey fragment boxes at the joint mid-point.
+They are **not Rapier bodies** — early attempts with dynamic or fixed physics fragments either
+**exploded the solver** (|coord| ~10⁶–10⁷ m under lifting bags) or **inflated `DebrisSupport`**
+readings (9000+ kN carrying). Final design:
+
+- `sim._spawnSplinters(rec)` → **`onSplinter(chips, parentPart)`** callback.
+- Renderer parents each chip to **`rec.a`'s mesh** in local coordinates so chips **move with the
+  broken segment** instead of hanging at the old world-space fracture point.
+- **`splinterOnCrack: 0`** — slab seam chips off by default (beam/column snaps are where
+  splintering reads); turning it on spammed chips that confused bag interface rays.
+
+### Cement-dust cloud (renderer-only)
+Dust is not a material property — it is impact energy dissolving into fines. Implemented as:
+
+- **`sim.dustQueue`** + `drainDustEvents()` — physics emits `{x,y,z,count,spread}`; renderer
+  never touches Rapier for dust.
+- **`spawnDustCloud`** — up to 2500 billboard `Points`, brown-grey, 2.5–5 s lifetime, light
+  gravity + drag.
+- **Burst on `collapse()`** — `dustCollapseBurst` (100) × `concreteFcRef / concreteFc`
+  (~1.47× at default weak mix).
+- **Puffs on hard contacts** — force > `dustContactForce` (350 kN), scaled the same way.
+- **Fog tightens** while `phase === 'collapsing'` (near 18 m / far 72 m vs 28 / 88 standing).
+
+Weak mix ⇒ more dust for the same impact, without a separate "cement ratio" slider.
+
+### Flying bricks frozen in mid-air
+Two bugs, one screenshot:
+
+1. **Furniture + loose segments** — soft-freeze slept every dynamic body wherever it was,
+   including brown furniture boxes and grey beam chunks still falling. **`freeze()` now runs
+   `_settleAirborne()`** first: raycast downward from each piece's bottom; if no support within
+   ~22 cm, wake it and step physics (up to ~300 frames). Anything still floating is **`_removePart`**
+   (stray debris that would never land cleanly in the settle window).
+2. **Splinter chips at old snap positions** — fixed by parenting chips to the broken part (above).
+
+Press **P** rebuild / **C** collapse after pulling; **F** re-freeze runs the airborne pass again.
+
+### Rescue / headless notes
+- **`placeBag`** skips **`kind === 'fragment'`** hits when ray-finding the lift target (hole plugs
+  are real fragments; splinter chips no longer are).
+- Dynamic splinter experiments broke **`verify-lift.mjs`** intermittently; visual-only splinters
+  restored stability. Full **`npm run verify`** should be re-run after lattice/splinter changes.
+
 ## Gotchas / guardrails
 
 - **Black screen = a load-time exception, not a render bug.** Root cause once: `main.js`
@@ -437,8 +530,241 @@ reinforcement became a 3D cage, and its visibility became an *event*, not a cons
 ## Open items / future
 
 - True visible **bending** of members (needs soft-body/FEM, or a visual-only mesh-bend).
-- **Void reachability** — which detected voids connect to the surface (the real USAR question).
-- **Victim placement** at void centres using the exported ground-truth JSON.
 - ~~Concrete **cover-spall** so steel is exposed "by cutting", per the photos.~~ Done in
   iteration 13 — the hammer spalls a face and `onExpose` skins the concrete over the cage.
-- Perf: ~150–250 bodies during collapse; watch frame rate as `grid`/`stories` grow.
+- Perf: ~150–280 bodies during collapse (weak-mix defaults + extra segments); watch frame rate
+  as `grid`/`stories` grow. Dust particles capped at 2500; rebar rod count scales with
+  `rebarSpacing`² via stirrups.
+
+### Golden grail — rescuer / victim access (void “reaching”)
+
+**Deferred design call (2026-07-31):** void markers are now a faint spherical wireframe hint
+only; we track detected + compromised counts. “Reaching a void” is *not* camera/tool proximity —
+it means a **human rescuer accessing a victim** inside a survivable pocket.
+
+**Shipped (2026-07-31 → 2026-08-01) — rescuer agent + camera + stability:**
+
+- **Appearance:** procedural Civil Defence humanoid (`src/rescuer-mesh.js`) — orange tee with
+  canvas “CIVIL DEFENCE” text, digi-camo trousers, red helmet, black ammo boots. Physics is a
+  Rapier capsule (`src/rescuer.js` + `rescuer-constants.js`); no GLTF.
+- **Control:** `R` spawns / toggles rescuer mode; WASD walk (camera-relative), Space jump,
+  `E` pull-up or mount ladder. Extension ladder is equipment key `8`.
+- **Camera:** default **3rd-person shoulder** with OrbitControls pan / zoom / tilt (target
+  follows the rescuer). `T` (or GUI “Rescuer view”) switches to **1st-person eyes** with look
+  + scroll zoom. Do not overwrite `camera.position` every frame in 3rd-person — that jammed
+  the view into debris and fought WASD.
+- **Grounding:** sim ground is a fixed Rapier body (not a parentless collider). Spawn
+  `snapToGround()` plants feet on y≈0; softer KCC ground bias to avoid W-key vertical
+  oscillation against rubble.
+- **Rebuild:** clear the rescuer **before** `sim.dispose()` — disposing the world first left
+  `removeCollider` on freed WASM memory and crashed rebuild (P).
+- **Loads / settle:** walk must not bulk-`_wakeNear` every tick (that froze→woke→collapsed in
+  a loop and hung the browser). Mantle may still one-shot wake. Live-load capacity refresh is
+  throttled. `doFreeze` defers if `world.step()` is in flight (Rapier aliasing).
+- **Victims:** prone figures at void centres after freeze; `VICTIM_ACCESSED` when the rescuer
+  reaches one whose void is not compromised. Agents / ladders / victims are excluded from the
+  intrusion AABB test (only debris compromises).
+- **Verify:** `verify-rescuer.mjs` (wired into `npm run verify`); Playwright `shoot-ui` /
+  hang checks used while debugging.
+
+Still open: multi-rescuer teams, victim physiology beyond accessed/lost, climb animations / IK,
+and tightening locomotion to real USAR movement limits (next).
+
+**Next :** we will now establish the constraints for the rescuer’s locomotion.
+- Rescuer cannot walk through rubble. Two solid bodies cannot occupy the same space. If he collides with a body, give a light audio signal like a man hitting concrete with his trunk or feet.
+- If jumping (space) lands him on a solid object not more than 1 metre high at the point of landing, land him there (a few cm in front and upto 1 m high). But the maximum vertical incline of the plane at the point should not be more than 30 degrees, or else he slides back.
+- If jumping brings his raised hands within reach of an edge , which is upto 7 m in height from where he jumps, he will grab the edge and pull himself up. Again, the max vertical incline should be respected. or slippage will occur
+
+**Implemented (2026-08-01) — locomotion constraints above:**
+
+- **Solid collision:** Rapier KCC already rejects interpenetration. Horizontal wish largely blocked by a
+  near-vertical hit → `RESCUER_BUMP` + `playBodyBump()` (soft trunk/boot thud).
+- **Jump land ≤ 1 m:** takeoff feet stored on Space; on touchdown, rise and surface slope (≤30°) are
+  checked. Fail → slide-back toward takeoff + status. Pass → plant a few cm forward.
+- **Jump grab ≤ 7 m:** while airborne, multi-height face probes find an edge (a single hand-height
+  ray flies over the deck); slope ≤30° required or `RESCUER_GRAB_FAIL` (slip). Success starts the
+  existing mantle pull-up. Standing `E` uses the same slope/height rules. KCC max climb slope set
+  to 30° to match. Standing-jump apex ~0.75 m → hands reach ~2.9 m from takeoff; 7 m is the cap for
+  jumps from raised perches.
+- Constants live in `src/rescuer.js` (`MAX_JUMP_LAND_H`, `MAX_GRAB_H`, `MAX_SLOPE_DEG`, …).
+
+**Fix (2026-08-01) — Casper / spawn bounce:** soft-frozen piles skip `world.step()`, so the Rapier
+query pipeline went stale after kinematic `setTranslation`. KCC then saw no solids → walk-through
+debris + gravity/snap oscillation through slabs. Fix: `propagateModifiedBodyPositionsToColliders` +
+`updateSceneQueries` on every pose / KCC move; latch grounded in `snapToGround`; ignore Space until
+`locoReady`. Verify covers frozen (no-step) wall blocking.
+
+**Fix (2026-08-01) — floating solids after freeze:** `_isAirborne` had dropped `excludeCollider`
+(Rapier aliasing workaround) and was self-hitting, so floaters held by fixed joints never dropped.
+Now excludes `part.body`, casts from under the AABB, detaches joints on still-airborne pieces during
+`_settleAirborne`, and multi-pass culls leftovers.
+
+**Fix (2026-08-01) — tip / friction / remaining floaters:** soft-freeze was sleeping pieces mid-tip
+and mid-slip (furniture on a corner, slabs with ~30 cm air). Now:
+
+- Multi-point support from the *lowest* box corners; one-corner “balance” counts as unsettled
+  (CoG torque must tip it).
+- Longer airborne settle + `_stabilizePile` (keep stepping while unsupported or still moving) before
+  sleep; refuse to sleep unsettled leftovers (cull instead).
+- Coulomb friction μ=0.65 concrete / 0.35 furniture, Min combine; lower linear/angular damping so
+  slip and tip can finish. Lean-to slabs at steep angles are kept (valid USAR) — we do not cull
+  merely for world-tilt.
+
+**Reverted + replaced (2026-08-01) — contact-based equilibrium.** The settle/stabilize/cull surgery
+above was the wrong cure and caused the two-stage collapse: `freeze()` was re-simulating for up to
+600 frames, breaking ~100 rebar ties and deleting 36–57 pieces, so the pile visibly moved a second
+time after it had already come to rest. Its support test was also wrong for rubble — downward
+raycasts from the lowest corners cannot see the wedged and leaning faces that carry most of a pile,
+so it condemned pieces that were properly supported. All of it is gone.
+
+*Freeze is now inert:* zero the velocities, `sleep()`, rebuild support. Nothing moves, no tie
+breaks, nothing is deleted (asserted in `verify-equilibrium.mjs`). `setCanSleep(false)` was removed
+too: every structural piece is built `fixed:true` and only turns dynamic in `collapse()`, so the
+guard never applied to them anyway — and a body created with `canSleep=false` *ignores* `sleep()`,
+which quietly broke the soft freeze. Damping is back to 0.08 / 0.30.
+
+*Equilibrium is decided from contacts, not rays* (`_equilibriumOf`). For each piece at rest we read
+Rapier's narrow phase — contact points, normals, solver impulses — and classify it:
+
+| state | meaning |
+| --- | --- |
+| `unsupported` | nothing transmits force to it and no rebar holds it: it is floating |
+| `hanging` | no contact carries it; a tie does. Real for a panel off the pile edge |
+| `wedged` | held by side friction (arching). Σ μ·N must cover the weight, else `unsupported` |
+| `loaded` | tied, or surcharged by debris above — forces we cannot see, so no free-body test |
+| `tipping` | free-standing, CoG outside the load-bearing footprint (support polygon, XZ hull) |
+| `slipping` | free-standing on a plane steeper than atan(μ) — the block-on-an-incline condition |
+
+Two Rapier details cost a while to find: contact points are in each collider's **local** frame and
+the manifold keeps its own collider order (`flipped` says ours is the second), and impulses are
+indexed by **contact**, not by solver contact — `numSolverContacts()` is routinely smaller than
+`numContacts()`, so iterating the solver list silently drops the strongest support contacts and
+made well-supported beams read as tipping.
+
+*Nothing is culled or kicked.* Pieces that fail get `wakeUp()` during the collapse — sleeping bodies
+keep their manifolds, so a piece that dozed off balanced on a corner is caught and tips on its own.
+Capped at 3 attempts per piece: if the solver truly holds it, shaking it again is theatre.
+
+*Rest is drift, not velocity.* The 184–248 rebar ties keep a settled pile buzzing for ever (only
+34/198 bodies ever sleep, p90 speed ~0.06 m/s at t=24 s), but over 4 s the worst piece moves 2.7 cm.
+So a piece is at rest when it has not gone anywhere in half a second. `main.js` freezes on
+`sim.isSettled()` rather than on the stopwatch alone (cap 2× `settleSeconds`), which is what stops
+pieces being frozen mid-fall.
+
+*Limits.* One pass per frame clamps debris to 25 m/s / 25 rad/s and deletes anything below
+y = −1.5 m. A fragment pinched between a lifting bag and the slab it is jacking was picking up a
+penetration-recovery velocity of 2600 m/s and falling through the floor for ever, dragging the
+scene's coordinates to 10⁷ m; nothing in a three-storey collapse falls faster than ~20 m/s.
+
+Result on seed 2 (198 pieces): `unsupported 0`, `failing 0`, `moving 0`, ~26 `hanging` on rebar, of
+which only 2–3 have real air beneath them. Freeze moves nothing (max 0.000000 m). The frozen census
+is on `sim.equilibrium` and in the HUD status line.
+
+**Follow-up (2026-08-01) — ties that yield under sustained load.** The gap left above: rebar ties
+only tore by **folding** past `slabTearAngle`, so a *steady* pull never broke one and a slab could
+hang rigidly in mid-air on a single tie for ever, with no sag at all. A fixed joint does not care
+how hard it is pulled.
+
+`_yieldTiesOf` adds the missing check. Gravity acts through the centre of gravity, so a tie offset
+horizontally from it carries the weight as **bending**: `M = share × lever`. Past the seam's
+cracking moment the weld is replaced by a revolute hinge and the piece rotates down; past the bars'
+tensile capacity (`_tieBarCapacity`, from bar count × area × `steelFy`) it separates outright. Only
+pieces already judged at rest are evaluated, so this never fires mid-collapse.
+
+Two corrections were needed before it did anything useful:
+
+- *Surcharge counts.* The first version only ran on `hanging` pieces — which by definition have
+  **zero** contacts, so debris resting on them could never enter the demand. The case that matters
+  is a tie-borne piece with a slab lying across it, which classified as `loaded` and was skipped
+  entirely. `_equilibriumOf` now reports `tieBorne` + `surcharge` (downward contact impulse ÷ dt,
+  less what the pile still gives back) and the check runs on both. Yields per collapse: 0 → ~22.
+- *Plain concrete is derated.* The mean modulus of rupture is optimistic for a seam that has just
+  been through a collapse: unreinforced flexure is brittle and scatters badly, which is why ACI 318
+  uses φ ≈ 0.60 for it. `plainConcretePhi` (0.6) applies that. Yields ~22 → ~37.
+
+Effect across seeds 2/7/13/21/34: pieces with real air beneath them (>0.2 m, measured by ray from
+the centre) drop from **6–8 to 2–4**, and the survivors are mostly slabs on 2–3 ties, i.e. genuinely
+*spanning* a void between two anchors — which is what a floor slab does for a living and should not
+be deleted. The single-tie leftovers are short columns and beams hanging vertically (lever ≈ 0, so
+pure tension, which the bars easily hold — the classic dangling-column image). `unsupported` stays
+0. New counter `stats.yields` separates these from impact-driven `cracks` / `snaps`.
+
+**`verify-shore` (2026-08-01).** Both failures were test bugs, not physics:
+
+- “bracing raises P_cr” read `after.governing`, but that object stores the key as `gov`, so it was
+  always `undefined`. The assertion itself is now “bracing helps, *unless* crushing already
+  governs”: at `concreteFc` 17 MPa the braced column is crush-governed at 32 kN, and demanding a
+  further 1.5× would be demanding that timber add concrete section.
+- “shoring rescues the lift” bagged the single heaviest slab in the pile — 80 kN against a 39 kN
+  bag, where no realistic shoring bridges the gap. It now picks the *lightest* slab that still
+  stalls the bag. The assertion also judged `bag.lift`, which is bag **growth**, not debris
+  movement; but the slab's own rise is not conclusive either, because placing a bag wakes the
+  surrounding rubble and the slab drifts ~0.12 m even with a bag that never inflates. Both readings
+  now have to agree: the bag could not grow at all unaided, and after shoring it grows >5 cm *and*
+  the slab ends up higher than it did unaided.
+
+Also fixed in `rescue.js`: `_assessBag` recomputed `stalled` every frame from the support-graph
+estimate alone, clobbering the contact-measured value that actually gates inflation — the HUD could
+read “not stalled” for a bag measuring twice its rating that had not moved a millimetre. Both sites
+now use the same test.
+
+**Fix (2026-08-01) — the rescuer was an 80-tonne man.** Reported as: jumping against an inclined
+slab knocks it flying, though the slab outweighs him by orders of magnitude and is not precariously
+perched. `setCharacterMass(80)` — commented “kg”. **sim.js works in tonnes (Mg) throughout**, so
+that made the KCC treat the rescuer as 80 000 kg. Measured: walking into a free-standing **31 t**
+block shoved it **6.94 m at 4.16 m/s**. At a correct body mass the same walk moves it **11 mm** and
+it never gets moving. Character mass is now derived from `opts.rescuerLoad / gravity` (1.2 kN → 0.122 t)
+so it cannot drift from the live load the frame model already books for a rescuer; `RESCUER_MASS_T`
+in `rescuer-constants.js` is the fallback, spelled in tonnes with a warning.
+
+*This is the same class of bug worth watching for elsewhere:* every mass, force and stress in this
+project is Mg / kN / kPa, so any figure that looks right in SI is wrong here by 1000.
+
+A **second, independent** mechanism turned up while measuring this, and is **deliberately kept**.
+On a frozen pile `step()` returns immediately, so walking moves literally nothing (0 pieces,
+verified). But a jump that finds a ledge starts a mantle, and `_tryMantle` sets
+`sim.phase = 'collapsing'` for the WHOLE pile: one mantle re-animates all 198 pieces and **108–116
+of them shift >5 cm** as they re-settle — worst 0.93 m (seed 2), and 4.17 m on a 0.2 t fragment
+(seed 7). The mass fix cut that worst case from 4.70 m, but cannot remove the effect itself.
+
+Decision: a rescuer hauling his weight onto rubble and shifting the pile is realistic, and this is
+the training point — so it stays. Note the constraint if it is ever revisited: `_wakeNear` alone
+cannot achieve a *local* wake, because a frozen sim does not step at all, so waking anything
+requires the global phase flip. Doing it properly would mean letting a soft-frozen pile step
+whenever any body is awake (an all-asleep pile cannot move, and sleeping bodies are nearly free in
+Rapier) — but an earlier attempt at per-tick waking produced a freeze→wake→collapse loop that hung
+the browser, so that path needs care.
+
+**Rescuer ↔ equipment coupling (2026-08-01).** Tools used to float free of the man: any of them
+could be applied by mouse raycast anywhere the camera could see, with no rescuer on site and no
+range limit. The cutter is the first tool switched to rescuer-relative working; the others keep
+free aim until their turn (`equipment.js` `needsReach`).
+
+*Gate.* Equipment selection (keys 1–8, tool ring, lil-gui dropdown) is locked until a rescuer is
+spawned (`R`). Clearing him or rebuilding drops the selection to None and greys the ring again.
+
+*Carry.* Selecting a tool clips a procedural prop (`src/tool-mesh.js`) into his right fist; the arm
+aims at the work point when it is inside the envelope. In first person (`T`) the body mesh is
+hidden and a camera-parented forearm + tool viewmodel takes its place — you see the hand and the
+machine, and look ahead. Over the shoulder the real arm holds the real prop.
+
+*Reach.* `src/rescuer-reach.js` is pure geometry (no three.js / Rapier): a sphere of radius
+`ARM_REACH + toolLength` centred on the right shoulder, plus a ±60° forward cone measured from the
+torso axis (not the offset shoulder — that wrongly refused points straight overhead). The player
+must walk him to the work face with WASD; there is no auto-walk. The envelope agrees with
+`HAND_REACH = 2.15 m` in `rescuer.js` so a tool cannot touch what a bare hand could not.
+`verify-reach.mjs` covers this; `shoot-tooling.mjs` drives the wiring in a browser.
+
+*Cut plane.* There is no separate `wall` part kind — a wall is a `slab` tile standing on edge.
+`sim.cutHoleInSlab` always bores through the tile's thickness, so a floor face gives a
+near-horizontal opening and a leaning face a near-vertical one. The status line names which.
+Aim must be square-on to a broad face (not the thin edge). On apply he yaws to face the spot.
+
+*No floating blade.* The old disc-cutter sprite that followed the mouse is gone. Aim with the
+mouse, right-click an eligible spot, and the cut fires. The only on-screen tell left for the
+cutter is the green/amber square hole footprint on the tile (green = right-click will cut).
+
+**Next — expand reach gating to the remaining tools one at a time** (saw, rebar, torch, hammer,
+bag, shore; ladder already mounts via `E`). Flip `needsReach: true` and harden each tool's
+eligibility the same way the cutter was.
+
