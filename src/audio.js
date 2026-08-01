@@ -90,3 +90,61 @@ export function stopGrind() {
   grindGain.gain.cancelScheduledValues(t);
   grindGain.gain.setTargetAtTime(0.0001, t, 0.06);
 }
+
+// --- demolition hammer (electric breaker) -------------------------------------------------------
+// A rhythmic train of low thuds + grit bursts while RMB is held. Cleared on mouse-up.
+
+let hammerTimer = null;
+
+/** One percussive strike — low body thud plus a short noise slap. */
+function playHammerStrike() {
+  const c = ensureAudio();
+  if (!c) return;
+  const t = c.currentTime;
+
+  // Body of the hit: descending sine, like a mass striking concrete.
+  const o = c.createOscillator(), g = c.createGain();
+  o.type = 'sine';
+  o.frequency.setValueAtTime(140, t);
+  o.frequency.exponentialRampToValueAtTime(55, t + 0.07);
+  o.connect(g).connect(c.destination);
+  g.gain.setValueAtTime(0.0001, t);
+  g.gain.exponentialRampToValueAtTime(0.14, t + 0.004);
+  g.gain.exponentialRampToValueAtTime(0.0001, t + 0.09);
+  o.start(t); o.stop(t + 0.1);
+
+  // Grit / bit chatter on the surface.
+  if (noiseBuf) {
+    const src = c.createBufferSource(); src.buffer = noiseBuf;
+    const f = c.createBiquadFilter(); f.type = 'bandpass';
+    f.frequency.value = 900; f.Q.value = 0.8;
+    const ng = c.createGain();
+    src.connect(f).connect(ng).connect(c.destination);
+    ng.gain.setValueAtTime(0.0001, t);
+    ng.gain.exponentialRampToValueAtTime(0.09, t + 0.003);
+    ng.gain.exponentialRampToValueAtTime(0.0001, t + 0.06);
+    src.start(t); src.stop(t + 0.07);
+  }
+}
+
+/**
+ * Start the breaker loop. Idempotent — holding the mouse down longer does not stack timers.
+ * `intervalMs` defaults to ~8 strikes/sec (a busy electric hammer).
+ */
+export function startHammer(intervalMs = 125) {
+  ensureAudio();
+  if (hammerTimer != null) return;
+  // NaN / 0 would schedule setInterval(..., 0) and flood the main thread with oscillators —
+  // that is what made right-click appear to hang the whole sim.
+  const ms = Math.max(50, Number(intervalMs) || 125);
+  playHammerStrike();
+  hammerTimer = setInterval(playHammerStrike, ms);
+}
+
+/** Silence the breaker — call on pointerup / tool change / lost engagement if desired. */
+export function stopHammer() {
+  if (hammerTimer != null) {
+    clearInterval(hammerTimer);
+    hammerTimer = null;
+  }
+}

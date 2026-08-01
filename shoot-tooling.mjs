@@ -34,7 +34,7 @@ const locked = await page.evaluate(() => {
 });
 check('the cutter cannot be selected before a rescuer exists',
   locked.afterApi.tool === 'NONE' && !locked.afterApi.unlocked, locked.status);
-check('all eight ring buttons are greyed out', locked.disabled === 8, `${locked.disabled} disabled`);
+check('all seven ring tool buttons are greyed out', locked.disabled === 7, `${locked.disabled} disabled`);
 
 // The keyboard must not be a way round the gate.
 await page.keyboard.press('1');
@@ -66,14 +66,18 @@ if (!target) { console.log('no intact slab left to aim at'); await browser.close
 console.log(`target tile at (${target.x.toFixed(2)}, ${target.y.toFixed(2)}, ${target.z.toFixed(2)})`);
 
 // Free camera, parked looking down at the tile, so both trials aim at exactly the same pixel.
-const aimAt = async (world) => {
-  await page.evaluate((w) => {
+// `topDown` raises the camera steeper — used for thin rebar rods that a glancing ray can miss.
+const aimAt = async (world, topDown = false) => {
+  await page.evaluate((args) => {
+    const { w, topDown: td } = args;
     const { camera, controls, params } = window.__app;
     params.rescuerMode = false;                 // free orbit; the rescuer stays where he is put
-    camera.position.set(w.x + 2.6, w.y + 3.2, w.z + 2.6);
+    const lift = td ? 4.2 : 3.2;
+    const back = td ? 1.4 : 2.6;
+    camera.position.set(w.x + back, w.y + lift, w.z + back);
     controls.target.set(w.x, w.y, w.z);
     controls.update();
-  }, world);
+  }, { w: world, topDown });
   await page.waitForTimeout(150);
   const s = await page.evaluate((w) => window.__app.project(w), world);
   await page.mouse.move(s.x, s.y);
@@ -169,7 +173,47 @@ check('a tile on edge is workable and reads as a near-vertical cut plane', !!ver
   verticalSeen ? '' : 'none of the steep tiles was visible to the cursor');
 if (verticalSeen) await page.screenshot({ path: `${OUT}/tool_5_vertical.png` });
 
+// --- 4c. rebar cutter: aim at a VISIBLE red rod, with the same reach gate --------------------
+// Freeze first so the rod we pick does not drift between project() and the click.
+await page.evaluate(() => window.__app.doFreeze());
+await page.waitForTimeout(200);
+await page.evaluate(() => window.__app.setEquipment('Rebar cutter'));
+const rb = await page.evaluate(() => window.__app.firstRebar());
+if (!rb) {
+  console.log('no exposed rebar rod this seed — skipping rebar reach checks');
+} else {
+  console.log(`exposed rebar rod at (${rb.x.toFixed(2)}, ${rb.y.toFixed(2)}, ${rb.z.toFixed(2)})`);
+  const rbAim = rb.aim || rb;
+  // Far away: the ray may still see the rod, but the arm must refuse.
+  await page.evaluate((w) => window.__app.teleportRescuer({ x: w.x + 8, y: w.y, z: w.z + 8 }, 0, false), rb);
+  await aimAt(rbAim, true);
+  const rbFar = await page.evaluate(() => window.__app.toolState());
+  check('the rebar cutter refuses a rod he is nowhere near',
+    !rbFar.engaged && /reach|closer/i.test(rbFar.reason), rbFar.reason);
+  await page.screenshot({ path: `${OUT}/tool_7_rebar_out_of_reach.png` });
+
+  // Beside the rod, facing it.
+  await page.evaluate((w) => {
+    const yaw = Math.atan2(-0.5, -0.5);
+    window.__app.teleportRescuer({ x: w.x + 0.5, y: w.y + 0.15, z: w.z + 0.5 }, yaw, false);
+  }, rb);
+  await aimAt(rbAim, true);
+  const rbNear = await page.evaluate(() => window.__app.toolState());
+  check('the same rod is snippable once he is beside it', rbNear.engaged, rbNear.reason);
+  check('his arm reaches for the rebar', rbNear.aiming);
+
+  const beforeRb = await page.evaluate(() => window.__app.sim().stats.cuts);
+  const srb = await page.evaluate((w) => window.__app.project(w), rbAim);
+  await page.mouse.click(srb.x, srb.y, { button: 'right' });
+  await page.waitForTimeout(800);
+  const afterRb = await page.evaluate(() => window.__app.sim().stats.cuts);
+  check('right-click snipped the exposed rebar', afterRb > beforeRb, `cuts ${beforeRb} → ${afterRb}`);
+  await page.screenshot({ path: `${OUT}/tool_8_rebar_snip.png` });
+}
+
 // --- 5. first person shows the hand and the tool ----------------------------------------------
+// Re-select the cutter so the FP prop is the familiar disc (rebar may have been left selected).
+await page.evaluate(() => window.__app.setEquipment('Concrete cutter'));
 // T only toggles, and only applies the change through applyRescuerViewMode() — so hand it a known
 // starting point ('third') and press it exactly once.
 await page.evaluate(() => {

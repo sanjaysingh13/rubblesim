@@ -393,15 +393,17 @@ The code checks that actually decide things are **static** evaluations, so they 
 
 Select with the tool ring or keys **0–7**; right-click to use. Left-drag still orbits.
 
-| Tool | Effect |
-| --- | --- |
-| Concrete cutter | Square hole in a slab; the plug drops, keeping its momentum |
-| Concrete saw | Slices a tile clean through into two bodies (rebar and ties handed over) |
-| Rebar cutter | Hydraulic pliers; snips rebar exposed at a fracture |
-| Cutting torch | Removes any structural joint in reach, including embedded ties |
-| Breaching hammer | Spalls concrete — cuts section, exposes rebar, drops buckling capacity |
-| Lifting bag | 4/10/20 t; **stalls** if the debris outweighs its rating, capped at 50 cm |
-| Shoring | T-shore / lace shore; carries measured load and offloads the column it braces |
+| Tool | Key | Effect |
+| --- | --- | --- |
+| Concrete cutter | 1 | Square hole in a slab; the plug drops, keeping its momentum |
+| Rebar cutter | 2 | Long pliers, short blades; snips rebar exposed at a fracture |
+| Cutting torch | 3 | Removes any structural joint in reach, including embedded ties |
+| Demolition hammer | 4 | Hold right-click: chips a widening, deepening hole; rebar stays for the snips |
+| Lifting bag | 5 | 4/10/20 t; **stalls** if the debris outweighs its rating, capped at 50 cm |
+| Shoring | 6 | T-shore / lace shore; carries measured load and offloads the column it braces |
+| Extension ladder | 7 | Lean against a wall/slab face; mount with **E** in rescuer mode |
+
+(The concrete saw that once sliced a tile clean through is kept in code as a vestige but is not on the roster.)
 
 The training loop is the real one: an under-rated bag stalls, and the way out is to shore the load
 (or cut weight away) and lift again. Press **S** for the stress map (grey → red), **V** for the

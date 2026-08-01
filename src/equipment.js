@@ -8,7 +8,7 @@
 //          'rebar'    — only exposed reinforcement (raycast layer 1); a torch cannot cut concrete
 //          'gap'      — an interface / floor position rather than a surface (bags, shoring)
 //
-// `kind` tells the renderer which cursor to draw.
+// `kind` tells the renderer which cursor / prop to draw.
 //
 // RESCUER COUPLING (DEVLOG 2026-08-01)
 // ------------------------------------
@@ -22,8 +22,13 @@
 //                We are switching the tools over ONE AT A TIME (see the DEVLOG); everything still
 //                marked false keeps the old free-aim behaviour until its turn comes.
 //
-// Every tool is carried in the right hand once selected — that part is not staged, because a
-// rescuer must now be spawned before the equipment ring unlocks at all.
+//   available  — when false the tool is a VESTIGE: its apply() / mesh / sim path stay in the
+//                codebase so we can revive them later, but they are stripped from the tool ring,
+//                the lil-gui dropdown, and the 1–N hotkeys. Concrete saw is the first (and so
+//                far only) vestige — nothing in the field can slice a slab like butter yet.
+//
+// Every available tool is carried in the right hand once selected — that part is not staged,
+// because a rescuer must now be spawned before the equipment ring unlocks at all.
 
 export const TOOL_NONE = 'NONE';
 
@@ -34,12 +39,15 @@ export const EQUIPMENT = [
     holeSize: 0.6,        // default square side (m)
     toolLength: 0.45,     // petrol cut-off saw: body + 300 mm blade beyond the grip
     needsReach: true,     // first tool switched to rescuer-relative working (DEVLOG 2026-08-01)
+    available: true,
     // completion handled by main.js -> sim.cutHoleInSlab (removes plug, leaves a hole)
   },
+  // VESTIGE — kept so a future "slice a slab like butter" tool can reuse sliceSlab + the disc
+  // mesh. Stripped from every player-facing interface (`available: false`).
   {
-    id: 'CONCRETE_SAW', label: 'Concrete saw', short: 'Saw', kind: 'slice', picks: 'concrete', key: '2',
+    id: 'CONCRETE_SAW', label: 'Concrete saw', short: 'Saw', kind: 'slice', picks: 'concrete', key: null,
     hint: 'Slice a slab clean through — it splits into two bodies that keep their momentum.',
-    toolLength: 0.45, needsReach: false,
+    toolLength: 0.45, needsReach: false, available: false,
     apply(sim, { part, local, axis }) {
       if (!part || part.kind !== 'slab') return { severed: 0, points: [] };
       const res = sim.sliceSlab(part, axis, axis === 'x' ? local.x : local.z);
@@ -49,48 +57,54 @@ export const EQUIPMENT = [
     },
   },
   {
-    id: 'REBAR_CUTTER', label: 'Rebar cutter', short: 'Rebar', kind: 'rebar', picks: 'rebar', reach: 0.55, key: '3',
-    hint: 'Hydraulic pliers: snip exposed rebar in a fracture so the pieces separate.',
-    toolLength: 0.55, needsReach: false,
+    // Hydraulic snips: long handles, short blades. Cuts the exposed rebar (cracked tie hinge)
+    // bridging a fracture between two slab pieces — the mouth is short (~0.55 m), so he has to
+    // walk right up to the seam. Second tool switched to rescuer-relative working.
+    id: 'REBAR_CUTTER', label: 'Rebar cutter', short: 'Rebar', kind: 'rebar', picks: 'rebar', reach: 0.55, key: '2',
+    hint: 'Long pliers, short blades: snip any exposed red rod in reach (hole cage, frayed edge, fracture).',
+    toolLength: 0.70,     // long handles — fist to blade tips
+    needsReach: true,
+    available: true,
     apply(sim, { point }) { return sim.cutRebar(point, this.reach); },
   },
   {
-    id: 'TORCH', label: 'Cutting torch', short: 'Torch', kind: 'torch', picks: 'rebar', reach: 0.8, key: '4',
+    id: 'TORCH', label: 'Cutting torch', short: 'Torch', kind: 'torch', picks: 'rebar', reach: 0.8, key: '3',
     hint: 'Burns through any structural joint in reach — including still-embedded ties.',
-    toolLength: 0.40, needsReach: false,
+    toolLength: 0.40, needsReach: false, available: true,
     apply(sim, { point }) { return sim.cutJointNear(point, this.reach); },
   },
   {
-    id: 'BREACHING_HAMMER', label: 'Breaching hammer', short: 'Hammer', kind: 'hammer', picks: 'concrete', reach: 0.6, key: '5',
-    hint: 'Spalls concrete: removes section (collapsing buckling capacity) and exposes rebar.',
-    toolLength: 0.70, needsReach: false,
-    apply(sim, { point }) {
-      const res = sim.spallAt(point, this.reach);
-      return { severed: res.spalled || res.exposed ? 1 : 0, points: [point], ...res };
-    },
+    // Electric demolition hammer (breaker): hold RMB to chip a widening, deepening circular
+    // breach. Rebar is exposed but left intact so the snips can clear the opening afterward.
+    id: 'BREACHING_HAMMER', label: 'Demolition hammer', short: 'Hammer', kind: 'hammer', picks: 'concrete', reach: 0.6, key: '4',
+    hint: 'Hold right-click: chips a widening, deepening hole. Rebar stays — clear it with the rebar cutter.',
+    toolLength: 0.75,     // body + chisel bit beyond the grip
+    needsReach: true,
+    available: true,
+    holdToUse: true,      // main.js: chip on an interval while RMB is down, not one-shot
   },
   {
-    id: 'LIFT_BAG', label: 'Lifting bag', short: 'Bag', kind: 'bag', picks: 'gap', key: '6',
+    id: 'LIFT_BAG', label: 'Lifting bag', short: 'Bag', kind: 'bag', picks: 'gap', key: '5',
     hint: 'Place at an interface and inflate. Stalls if the debris outweighs its rating.',
-    toolLength: 0.25, needsReach: false,
+    toolLength: 0.25, needsReach: false, available: true,
     apply(sim, { point, bagId }) {
       const bag = sim.rescue.placeBag(point, bagId || 'bag10t');
       return { severed: bag ? 1 : 0, points: bag ? [point] : [], bag };
     },
   },
   {
-    id: 'SHORE', label: 'Shoring', short: 'Shore', kind: 'shore', picks: 'gap', key: '7',
+    id: 'SHORE', label: 'Shoring', short: 'Shore', kind: 'shore', picks: 'gap', key: '6',
     hint: 'Erect a T-shore or lace shore to carry load before you lift.',
-    toolLength: 0.90, needsReach: false,
+    toolLength: 0.90, needsReach: false, available: true,
     apply(sim, { point, shoreId }) {
       const shore = sim.rescue.placeShore({ x: point.x, y: 0, z: point.z }, shoreId || 'tShore');
       return { severed: shore ? 1 : 0, points: shore ? [point] : [], shore };
     },
   },
   {
-    id: 'LADDER', label: 'Extension ladder', short: 'Ladder', kind: 'ladder', picks: 'concrete', key: '8',
+    id: 'LADDER', label: 'Extension ladder', short: 'Ladder', kind: 'ladder', picks: 'concrete', key: '7',
     hint: 'Lean a ladder against a wall or slab face when a pull-up is not enough. Mount with E in rescuer mode.',
-    toolLength: 1.10, needsReach: false,
+    toolLength: 1.10, needsReach: false, available: true,
     apply(sim, { point }) {
       const ladder = sim.rescue.placeLadder(point);
       return { severed: ladder ? 1 : 0, points: ladder ? [point] : [], ladder };
@@ -98,6 +112,10 @@ export const EQUIPMENT = [
   },
 ];
 
+/** Tools the player can actually pick — vestiges (available: false) are filtered out. */
+export const AVAILABLE_EQUIPMENT = EQUIPMENT.filter((e) => e.available !== false);
+
 export const equipmentById = (id) => EQUIPMENT.find((e) => e.id === id) || null;
 export const equipmentByLabel = (label) => EQUIPMENT.find((e) => e.label === label) || null;
-export const TOOL_LABELS = ['None', ...EQUIPMENT.map((e) => e.label)];
+// Dropdown / ring labels only list tools that are on the roster.
+export const TOOL_LABELS = ['None', ...AVAILABLE_EQUIPMENT.map((e) => e.label)];

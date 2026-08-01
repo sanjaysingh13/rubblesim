@@ -740,7 +740,7 @@ could be applied by mouse raycast anywhere the camera could see, with no rescuer
 range limit. The cutter is the first tool switched to rescuer-relative working; the others keep
 free aim until their turn (`equipment.js` `needsReach`).
 
-*Gate.* Equipment selection (keys 1–8, tool ring, lil-gui dropdown) is locked until a rescuer is
+*Gate.* Equipment selection (keys 1–7, tool ring, lil-gui dropdown) is locked until a rescuer is
 spawned (`R`). Clearing him or rebuilding drops the selection to None and greys the ring again.
 
 *Carry.* Selecting a tool clips a procedural prop (`src/tool-mesh.js`) into his right fist; the arm
@@ -764,7 +764,40 @@ Aim must be square-on to a broad face (not the thin edge). On apply he yaws to f
 mouse, right-click an eligible spot, and the cut fires. The only on-screen tell left for the
 cutter is the green/amber square hole footprint on the tile (green = right-click will cut).
 
-**Next — expand reach gating to the remaining tools one at a time** (saw, rebar, torch, hammer,
-bag, shore; ladder already mounts via `E`). Flip `needsReach: true` and harden each tool's
-eligibility the same way the cutter was.
+**Saw retired from the roster (2026-08-01).** Concrete saw stays in `EQUIPMENT` as a vestige
+(`available: false`) — `sliceSlab`, the disc mesh, and the apply path remain so a future
+"slice like butter" tool can reuse them — but it is stripped from the tool ring, lil-gui
+dropdown, and hotkeys. Keys renumbered: 1 cutter, 2 rebar, 3 torch, 4 hammer, 5 bag, 6 shore,
+7 ladder.
+
+**Rebar cutter ↔ rescuer (2026-08-01).** Second tool switched to rescuer-relative working
+(`needsReach: true`). Long pliers with short blades (`tool-mesh.js` `buildPliers`): twin
+handles, hydraulic head, stubby mouth. Aim snaps to the nearest cracked-tie seam inside the
+mouth (`params.cutReach` ~0.55 m); a green/amber crosshair marks the bar. He must walk to the
+fracture — out of reach refuses with the same envelope as the cutter; on snip he faces the
+seam. Rod diameter unchanged (~16 mm / `rebarThickness` 0.008 m radius).
+
+**Retarget — snip visible rods, not invisible seams (2026-08-01).** The player-facing target is
+any exposed rust-red rod in his vicinity: the cage left in a cut hole, bars protruding from a
+fractured edge, lattice through skinned cover. Raycast is restricted to the rebar layer; a
+green/amber crosshair sits on the rod under the cursor. `sim.cutRebar` severs that rod
+descriptor into stubs (`onRebarChange` rebuilds the mesh) and, if a cracked-tie hinge is also
+within reach, breaks it so fractured pieces can separate. Status no longer says "hover a
+fracture between slab pieces".
+
+**Demolition hammer (2026-08-01).** Replaced the one-shot "spall" sledge with an electric
+breaker. Hold right-click: `sim.chipBreach` widens and deepens a circular pocket each chip;
+rebar is exposed but never clipped. Once depth reaches the tile thickness the colliders open
+a through-hole (ingress / camera drop) with the lattice still spanning — clear it with the
+rebar cutter. Rhythmic hammer SFX for the whole mouse-down (`startHammer` / `stopHammer`).
+`needsReach: true`; prop is a motor body + chisel bit. Columns still fall back to `spallAt`.
+
+**Loose rebar falls (2026-08-01).** After a snip, rods (or a connected cage island) that no
+longer reach any concrete-anchored bar — e.g. a segment cut free on both sides inside a
+hammered opening — are removed from the parent mesh and spawned as dynamic debris
+(`_dropLooseRebar` / `_spawnRebarDebris`). Snip gap breaks lattice adjacency so stubs across
+a cut do not stay welded. `verify-rebar-fall.mjs` covers this.
+
+**Next — expand reach gating to the remaining tools one at a time** (torch, bag, shore;
+ladder already mounts via `E`). Flip `needsReach: true` and harden each tool's eligibility.
 

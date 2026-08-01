@@ -74,19 +74,55 @@ function buildDiscSaw(bladeRadius = 0.15) {
   return g;
 }
 
-/** Hydraulic rebar cutter: stubby hydraulic body with a short pair of jaws. */
+/**
+ * Hydraulic rebar cutter — long pliers with a short snipping mouth.
+ *
+ * Real field snips are a long pair of handles (leverage) ending in a stubby hydraulic head and a
+ * very short set of blades that close around one exposed bar. We model that silhouette with:
+ *   * two long handle tubes running from the grip (origin) out along +Z;
+ *   * a compact hydraulic head where the handles meet;
+ *   * a short pair of steel blades at the tip (the "mouth").
+ * Grip at the origin, working direction +Z — same convention as every other prop here.
+ */
 function buildPliers() {
   const g = new THREE.Group();
-  const body = new THREE.Mesh(new THREE.CylinderGeometry(0.05, 0.055, 0.30, 10), mat(BODY_BLUE));
-  body.rotation.x = Math.PI / 2;
-  body.position.z = 0.15;
-  g.add(body);
+
+  // Twin handles: long, slightly splayed, so the silhouette reads as pliers rather than a baton.
+  // The fist closes around the near end (origin); the far end feeds into the hydraulic head.
   for (const side of [-1, 1]) {
-    const jaw = new THREE.Mesh(new THREE.BoxGeometry(0.028, 0.05, 0.16), mat(STEEL, { metalness: 0.7 }));
-    jaw.position.set(side * 0.03, side * 0.02, 0.38);
-    jaw.rotation.x = side * 0.12;
-    g.add(jaw);
+    const handle = new THREE.Mesh(
+      new THREE.CylinderGeometry(0.018, 0.022, 0.48, 8),
+      mat(RUBBER, { metalness: 0.05, roughness: 0.85 }),
+    );
+    handle.rotation.x = Math.PI / 2;
+    // Offset sideways and angle open a few degrees so the two tubes diverge toward the grip.
+    handle.position.set(side * 0.035, 0, 0.24);
+    handle.rotation.z = side * 0.08;
+    g.add(handle);
   }
+
+  // Compact hydraulic body — the blue "motor" that drives the blades shut.
+  const head = new THREE.Mesh(
+    new THREE.CylinderGeometry(0.045, 0.05, 0.14, 10),
+    mat(BODY_BLUE, { roughness: 0.45 }),
+  );
+  head.rotation.x = Math.PI / 2;
+  head.position.z = 0.52;
+  g.add(head);
+
+  // Short blades at the tip. They are deliberately stubby (~12 cm) so the mouth matches the
+  // tool's `reach` of ~0.55 m: you present the tips to one exposed bar, not a long kerf.
+  for (const side of [-1, 1]) {
+    const blade = new THREE.Mesh(
+      new THREE.BoxGeometry(0.022, 0.045, 0.12),
+      mat(STEEL, { metalness: 0.75, roughness: 0.35 }),
+    );
+    blade.position.set(side * 0.025, side * 0.015, 0.66);
+    // Slight open angle so the mouth reads as jaws waiting to close on a bar.
+    blade.rotation.x = side * 0.18;
+    g.add(blade);
+  }
+
   return g;
 }
 
@@ -111,17 +147,55 @@ function buildTorch() {
   return g;
 }
 
-/** Breaching hammer: long shaft with a heavy head — a sledge, held near the butt. */
+/**
+ * Electric demolition hammer (breaker): motor housing, D-handle, and a chisel bit on +Z.
+ * Not a hand sledge — the bit is what chips the concrete while the trigger is held.
+ */
 function buildHammer() {
   const g = new THREE.Group();
-  const shaft = new THREE.Mesh(new THREE.CylinderGeometry(0.022, 0.026, 0.62, 8), mat(TIMBER, { metalness: 0.02, roughness: 0.85 }));
-  shaft.rotation.x = Math.PI / 2;
-  shaft.position.z = 0.31;
-  g.add(shaft);
-  const head = new THREE.Mesh(new THREE.BoxGeometry(0.10, 0.10, 0.20), mat(STEEL, { metalness: 0.75, roughness: 0.4 }));
-  head.rotation.y = Math.PI / 2;
-  head.position.z = 0.62;
-  g.add(head);
+
+  // Rear D-handle the fist closes around (grip near the origin).
+  const grip = new THREE.Mesh(
+    new THREE.TorusGeometry(0.045, 0.014, 6, 10, Math.PI),
+    mat(RUBBER, { metalness: 0.05 }),
+  );
+  grip.rotation.y = Math.PI / 2;
+  grip.rotation.z = Math.PI / 2;
+  grip.position.set(0, 0.02, 0.02);
+  g.add(grip);
+
+  // Motor / gearbox body — site-yellow housing.
+  const body = new THREE.Mesh(
+    new THREE.BoxGeometry(0.11, 0.14, 0.28),
+    mat(0xd4a017, { roughness: 0.55 }),
+  );
+  body.position.z = 0.20;
+  g.add(body);
+
+  const collar = new THREE.Mesh(
+    new THREE.CylinderGeometry(0.04, 0.045, 0.08, 8),
+    mat(DARK, { metalness: 0.5 }),
+  );
+  collar.rotation.x = Math.PI / 2;
+  collar.position.z = 0.38;
+  g.add(collar);
+
+  // Chisel bit — the working end along +Z.
+  const bit = new THREE.Mesh(
+    new THREE.CylinderGeometry(0.012, 0.018, 0.28, 6),
+    mat(STEEL, { metalness: 0.8, roughness: 0.35 }),
+  );
+  bit.rotation.x = Math.PI / 2;
+  bit.position.z = 0.56;
+  g.add(bit);
+  const tip = new THREE.Mesh(
+    new THREE.ConeGeometry(0.018, 0.06, 6),
+    mat(STEEL, { metalness: 0.85 }),
+  );
+  tip.rotation.x = Math.PI / 2;
+  tip.position.z = 0.72;
+  g.add(tip);
+
   return g;
 }
 

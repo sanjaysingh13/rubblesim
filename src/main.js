@@ -8,9 +8,9 @@ import { STLExporter } from 'three/addons/exporters/STLExporter.js';
 import GUI from 'lil-gui';
 import RAPIER from '@dimforge/rapier3d-compat';
 import { RubbleSim, DEFAULTS } from './sim.js';
-import { EQUIPMENT, TOOL_LABELS, equipmentById, equipmentByLabel } from './equipment.js';
+import { AVAILABLE_EQUIPMENT, TOOL_LABELS, equipmentByLabel } from './equipment.js';
 import { LIFT_BAGS, SHORE_TYPES } from './rescue.js';
-import { ensureAudio, playContact, playBodyBump, startGrind, stopGrind } from './audio.js';
+import { ensureAudio, playContact, playBodyBump, startGrind, stopGrind, startHammer, stopHammer } from './audio.js';
 import { RescuerAgent } from './rescuer.js';
 import { CAPSULE_HALF, CAPSULE_RADIUS } from './rescuer-constants.js';
 import {
@@ -35,6 +35,7 @@ const params = {
   equipment: 'None',          // active tool label; the enum lives in src/equipment.js
   cutReach: 0.55,             // rebar-cutter mouth reach (m) — short (hydraulic pliers)
   holeSize: 0.6,             // concrete-cutter square side (m)
+  hammerStartRadius: 0.10,   // demolition-hammer first bite (m)
   cutSettleSeconds: 3,       // local re-settle time after a cut
   bagSize: 'bag10t',         // which lifting bag to place
   shoreType: 'tShore',       // which shoring assembly to erect
@@ -82,13 +83,15 @@ const controls = new OrbitControls(camera, renderer.domElement);
 controls.target.set(0, 4, 0);
 controls.enableDamping = true;
 
-// --- Cut preview (concrete cutter only) -------------------------------------------------------
+// --- Cut / snip previews (concrete cutter + rebar cutter) --------------------------------------
 //
-// The old disc-cutter sprite that floated at the mouse is gone: the rescuer carries the real
-// machine in his right hand (src/tool-mesh.js). Aim with the mouse, right-click an eligible
-// spot, and the cut fires. The only on-screen tell left is the square footprint of the hole the
-// cutter would open — green when right-click will cut, amber when the tile is fine but something
-// else (usually the rescuer's reach) is stopping him.
+// The old floating tool sprites are gone: the rescuer carries the real machine in his right hand
+// (src/tool-mesh.js). Aim with the mouse, right-click an eligible spot, and the tool fires. The
+// on-screen tells left are:
+//   * cutter — the square footprint of the hole it would open
+//   * rebar  — a small crosshair on the exposed bar the mouth would snip
+// Green means right-click will fire; amber means the target is fine but something else (usually
+// the rescuer's reach) is stopping him.
 const MARK_OK = 0x33ff88;
 const MARK_NO = 0xff9a3c;
 
@@ -109,6 +112,54 @@ const squareOutline = new THREE.LineSegments(new THREE.BufferGeometry().setFromP
 squareFill.renderOrder = 997; squareOutline.renderOrder = 998;
 cutSquare.add(squareFill, squareOutline);
 scene.add(cutSquare);
+
+// Rebar snip mark: a small + crosshair sitting on the exposed bar. Built once as a unit cross and
+// scaled in showRebarPreview so the mouth size (params.cutReach) can grow without rebuilding.
+const rebarMark = new THREE.Group();
+rebarMark.visible = false;
+{
+  const arm = 0.5;   // half-extent of the unit cross before scale
+  const pts = [
+    new THREE.Vector3(-arm, 0, 0), new THREE.Vector3(arm, 0, 0),
+    new THREE.Vector3(0, -arm, 0), new THREE.Vector3(0, arm, 0),
+    new THREE.Vector3(0, 0, -arm), new THREE.Vector3(0, 0, arm),
+  ];
+  const cross = new THREE.LineSegments(
+    new THREE.BufferGeometry().setFromPoints(pts),
+    new THREE.LineBasicMaterial({ color: MARK_OK, depthTest: false }),
+  );
+  cross.renderOrder = 998;
+  // Soft fill sphere so the seam still reads when the cross is edge-on to the camera.
+  const bead = new THREE.Mesh(
+    new THREE.SphereGeometry(0.35, 10, 8),
+    new THREE.MeshBasicMaterial({ color: MARK_OK, transparent: true, opacity: 0.45, depthTest: false, depthWrite: false }),
+  );
+  bead.renderOrder = 997;
+  rebarMark.add(cross, bead);
+  rebarMark.userData.cross = cross;
+  rebarMark.userData.bead = bead;
+}
+scene.add(rebarMark);
+
+// Demolition-hammer footprint: a unit circle in the XY plane (normal +Z), scaled to the current
+// breach radius. Same green/amber language as the cutter square.
+const hammerMark = new THREE.Group();
+hammerMark.visible = false;
+{
+  const ring = new THREE.Mesh(
+    new THREE.RingGeometry(0.42, 0.5, 32),
+    new THREE.MeshBasicMaterial({ color: MARK_OK, transparent: true, opacity: 0.85, side: THREE.DoubleSide, depthTest: false, depthWrite: false }),
+  );
+  const fill = new THREE.Mesh(
+    new THREE.CircleGeometry(0.45, 32),
+    new THREE.MeshBasicMaterial({ color: MARK_OK, transparent: true, opacity: 0.28, side: THREE.DoubleSide, depthTest: false, depthWrite: false }),
+  );
+  ring.renderOrder = 998; fill.renderOrder = 997;
+  hammerMark.add(fill, ring);
+  hammerMark.userData.ring = ring;
+  hammerMark.userData.fill = fill;
+}
+scene.add(hammerMark);
 
 scene.add(new THREE.HemisphereLight(0x9fbfff, 0x20160f, 0.75));
 const sun = new THREE.DirectionalLight(0xfff2e0, 2.3);
@@ -379,6 +430,23 @@ function onReshape(part) {
   g.position.set(t.x, t.y, t.z); g.quaternion.set(r.x, r.y, r.z, r.w);
   g.userData.part = part; part.mesh = g; part.baseMat = mat;
   structureGroup.add(g);
+}
+
+/**
+ * Rebuild ONLY the rebar child after a rod has been snipped. The concrete shell (box or hole
+ * frame) stays put — we just tear out the old merged cylinder mesh and attach a fresh one from
+ * the updated `part.rebars` descriptors.
+ */
+function onRebarChange(part) {
+  if (!part?.mesh) return;
+  const doomed = [];
+  part.mesh.traverse((o) => { if (o.userData?.isRebar) doomed.push(o); });
+  for (const o of doomed) {
+    if (o.parent) o.parent.remove(o);
+    disposeMesh(o);
+  }
+  attachRebar(part.mesh, part);
+  if (part.rebarExposed) showRebar(part);
 }
 
 function clearMarkers() { for (const m of voidMarkers) markerGroup.remove(m); voidMarkers.length = 0; }
@@ -742,7 +810,7 @@ function rebuild() {
   compromised = 0; voidEvents.length = 0;
   freezeQueued = false;
   if (sim) sim.dispose();
-  sim = new RubbleSim(RAPIER, params, { onAdd, onRemove, onReshape, onExpose, onSplinter });
+  sim = new RubbleSim(RAPIER, params, { onAdd, onRemove, onReshape, onExpose, onRebarChange, onSplinter });
   const n = sim.build();
   phase = 'standing'; timer = 0;
   // Restore a sensible orbit view after first-person rescuer mode.
@@ -960,7 +1028,9 @@ const _tileAxis = new THREE.Vector3();
 function planHole(part, worldPoint, size) {
   if (!part || part.kind !== 'slab' || part.frame || !part.mesh) return null;
   part.mesh.updateWorldMatrix(true, false);
-  const local = part.mesh.worldToLocal(worldPoint.clone());
+  // Accept THREE.Vector3 or a plain {x,y,z} — chipHammerOnce passes the latter.
+  const wp = worldPoint.isVector3 ? worldPoint : _wv.set(worldPoint.x, worldPoint.y, worldPoint.z);
+  const local = part.mesh.worldToLocal(wp.clone());
   const s = part.shape;
   const border = 0.06;                       // sim.cutHoleInSlab keeps this much tile all round
   const rx = Math.min(size / 2, s.hx - border);
@@ -983,6 +1053,8 @@ function planHole(part, worldPoint, size) {
  * something else (usually the rescuer's reach) is stopping the tool.
  */
 function showHolePreview(plan, ok) {
+  rebarMark.visible = false;
+  hammerMark.visible = false;
   cutSquare.visible = true;
   cutSquare.position.copy(plan.centre).addScaledVector(plan.normal, 0.02);
   cutSquare.quaternion.copy(plan.quat);
@@ -990,6 +1062,72 @@ function showHolePreview(plan, ok) {
   const colour = ok ? MARK_OK : MARK_NO;
   squareFill.material.color.setHex(colour);
   squareOutline.material.color.setHex(colour);
+}
+
+/**
+ * Circular breach footprint for the demolition hammer.
+ * `radius` is the current (or starting) chip radius in metres.
+ */
+function showHammerPreview(centre, normal, quat, radius, ok) {
+  cutSquare.visible = false;
+  rebarMark.visible = false;
+  hammerMark.visible = true;
+  hammerMark.position.copy(centre).addScaledVector(normal, 0.025);
+  hammerMark.quaternion.copy(quat);
+  const d = Math.max(0.12, radius * 2);
+  hammerMark.scale.set(d, d, 1);
+  const colour = ok ? MARK_OK : MARK_NO;
+  hammerMark.userData.ring.material.color.setHex(colour);
+  hammerMark.userData.fill.material.color.setHex(colour);
+}
+
+function showRebarPreview(worldPoint, ok) {
+  cutSquare.visible = false;
+  hammerMark.visible = false;
+  rebarMark.visible = true;
+  rebarMark.position.set(worldPoint.x, worldPoint.y, worldPoint.z);
+  const s = Math.max(0.12, (params.cutReach || 0.55) * 0.35);
+  rebarMark.scale.setScalar(s);
+  const colour = ok ? MARK_OK : MARK_NO;
+  rebarMark.userData.cross.material.color.setHex(colour);
+  rebarMark.userData.bead.material.color.setHex(colour);
+}
+
+/** Hide every tool footprint — called when the tool is put down or the cursor leaves a target. */
+function clearToolPreviews() {
+  cutSquare.visible = false;
+  rebarMark.visible = false;
+  hammerMark.visible = false;
+}
+
+/**
+ * Plan where a demolition-hammer chip would land on a slab.
+ * Reuses the cutter's face/orientation math; radius comes from an in-progress breach or the
+ * starting bite. Returns null when this tile cannot be hammered (already a cutter hole).
+ */
+function planHammer(part, worldPoint) {
+  if (!part || part.kind !== 'slab' || !part.mesh) return null;
+  if (part.frame && !part.breach) return null;   // clean cutter opening — nothing to chip
+  part.mesh.updateWorldMatrix(true, false);
+  // Accept THREE.Vector3 or a plain {x,y,z} — chipHammerOnce passes the latter.
+  const wp = worldPoint.isVector3 ? worldPoint : _wv.set(worldPoint.x, worldPoint.y, worldPoint.z);
+  const local = part.mesh.worldToLocal(wp.clone());
+  const s = part.shape;
+  const border = 0.06;
+  const b = part.breach;
+  const r = b ? b.r : (params.hammerStartRadius || 0.10);
+  const cx = b ? b.cx : Math.max(-s.hx + r + border, Math.min(s.hx - r - border, local.x));
+  const cz = b ? b.cz : Math.max(-s.hz + r + border, Math.min(s.hz - r - border, local.z));
+  const faceSign = b ? b.faceSign : (local.y >= 0 ? 1 : -1);
+  const centre = part.mesh.localToWorld(new THREE.Vector3(cx, faceSign * s.hy, cz));
+  part.mesh.getWorldQuaternion(_tileQuat);
+  const normal = _tileAxis.set(0, faceSign, 0).applyQuaternion(_tileQuat).clone();
+  return {
+    cx, cz, r, centre, normal,
+    quat: _tileQuat.clone().multiply(Q_PLANE_TO_TILE),
+    depthFrac: b ? Math.min(1, b.depth / (s.hy * 2)) : 0,
+    through: !!(b && b.through),
+  };
 }
 
 // --- aim / engagement state ------------------------------------------------------------------
@@ -1010,29 +1148,42 @@ let aimPoint = null;         // world point the held tool is presented to, or nu
 let holePlanNow = null;      // planHole() for the tile under the cursor, or null
 let heldProp = null;         // the prop clipped into the rescuer's right fist
 let toolViewmodel = null;    // first-person forearm + tool, parented to the camera
-let cutUntil = 0;            // performance.now() until which the saw is in the concrete
+let cutUntil = 0;            // performance.now() until which the tool is actively working
 let equipCtrl = null;        // the lil-gui dropdown, so the gate can disable it
 // The mouse does not move while the rescuer walks, but the reach envelope moves with him — so the
 // aim has to be re-evaluated every frame from the last known pointer position, or a green square
 // would sit there after he has walked away from the work face.
 const lastPointer = { x: 0, y: 0, has: false };
+// World point of the exposed rebar the pliers are aimed at (set during updateToolAim). Kept
+// separately from hitPoint so an amber "out of reach" mark can still sit on the bar after the
+// reach check has cleared engaged.
+let rebarTarget = null;
+// Demolition hammer hold-to-chip state. Sound runs for the whole mouse-down; chips only tick
+// while the tip is on an eligible reachable spot.
+let hammerHeld = false;
+let hammerChipAcc = 0;
+let hammerPlanNow = null;    // planHammer() under the cursor, or null
+let hammerTargetPart = null; // slab locked for the duration of one RMB hold
 
 /**
  * Point the raycaster at only what the current tool can legitimately grab.
- * A torch/pliers see reinforcement (layer 1); cutters and the hammer see concrete (layer 0);
- * bag/shore placement needs the concrete surfaces to find an interface against.
+ * Cutters and the hammer see concrete (layer 0); bag/shore need concrete surfaces to find an
+ * interface. The REBAR CUTTER sees only reinforcement (layer 1) — it aims at the visible red
+ * rods (hole cage, frayed edges, skinned lattice), not at concrete faces. The torch keeps both
+ * layers so it can still find embedded joints near a rebar hit. Void volumes are never targets.
  */
 function setRaycastLayers() {
   raycaster.layers.enableAll();
   raycaster.layers.disable(LAYER_VOID);                  // void volumes are never targets
   if (!activeTool) return;
-  if (activeTool.picks === 'rebar') raycaster.layers.disable(LAYER_CONCRETE);
-  else raycaster.layers.disable(LAYER_REBAR);
+  if (activeTool.kind === 'rebar') raycaster.layers.disable(LAYER_CONCRETE);
+  else if (activeTool.picks !== 'rebar') raycaster.layers.disable(LAYER_REBAR);
 }
 
 /**
- * Raycast from the mouse, decide whether right-click would fire, and (for the cutter) lay the
- * hole footprint on the tile. No floating tool cursor — the machine is in the rescuer's hand.
+ * Raycast from the mouse, decide whether right-click would fire, and lay the matching footprint
+ * (hole square or rebar crosshair) on the target. No floating tool cursor — the machine is in
+ * the rescuer's hand.
  */
 function updateToolAim(clientX, clientY) {
   if (!toolActive() || !sim) return;
@@ -1042,8 +1193,10 @@ function updateToolAim(clientX, clientY) {
   ndc.set(((clientX - r.left) / r.width) * 2 - 1, -((clientY - r.top) / r.height) * 2 + 1);
   raycaster.setFromCamera(ndc, camera);
   const hits = raycaster.intersectObjects(structureGroup.children, true);
-  cutSquare.visible = false;
+  clearToolPreviews();
   holePlanNow = null;
+  hammerPlanNow = null;
+  rebarTarget = null;
   aimPoint = null;
   blockReason = '';
 
@@ -1059,10 +1212,29 @@ function updateToolAim(clientX, clientY) {
 
     // --- 1. does the TOOL have something it can act on here? ---------------------------------
     if (kind === 'rebar') {
-      const near = sim.exposedRebarNear(hitPoint, params.cutReach);
-      engaged = !!near;
-      if (near) hitPoint.set(near.x, near.y, near.z);
-      else blockReason = 'no exposed rebar in the mouth — hover a fracture between slab pieces';
+      // The snips bite any visible red rod under the cursor — cage in a cut hole, bars sticking
+      // out of a fractured edge, lattice through skinned concrete. Raycast is restricted to the
+      // rebar layer, so a hit here IS a rod. Snap the mark to the nearest rod axis so the
+      // crosshair sits on the bar, not on a glancing hit off to one side.
+      const onRod = !!(h.object.userData && h.object.userData.isRebar)
+        || !!(h.object.parent && h.object.parent.userData && h.object.parent.userData.isRebar);
+      if (!onRod) {
+        engaged = false;
+        blockReason = 'aim at an exposed red rod (in a hole, at a frayed edge, or through broken cover)';
+      } else {
+        const near = sim.exposedRodNear(hitPoint, params.cutReach);
+        if (near) {
+          engaged = true;
+          hitPoint.set(near.world.x, near.world.y, near.world.z);
+          hitPart = near.part;
+          rebarTarget = { x: near.world.x, y: near.world.y, z: near.world.z };
+        } else {
+          // Ray hit the merged rebar mesh but no descriptor was within mouth reach — rare, but
+          // still treat the hit point as workable so a direct hit on a stub is never refused.
+          engaged = true;
+          rebarTarget = { x: hitPoint.x, y: hitPoint.y, z: hitPoint.z };
+        }
+      }
     } else if (kind === 'torch') {
       engaged = !!sim.joints.find((rec) => !rec.broken && !rec.a.dead && !rec.b.dead &&
         (rec.type === 'tie' || rec.type === 'member') && jointNear(rec, hitPoint, tool.reach));
@@ -1073,6 +1245,29 @@ function updateToolAim(clientX, clientY) {
     } else if (kind === 'shore') {
       engaged = shoreFits(hitPoint);
       if (!engaged) blockReason = 'no headroom for a shore here';
+    } else if (kind === 'hammer') {
+      // Electric breaker: slabs get a progressive circular breach; columns/beams take a spall.
+      if (hitPart && hitPart.kind === 'slab') {
+        const plan = planHammer(hitPart, hitPoint);
+        if (!plan) {
+          engaged = false;
+          blockReason = hitPart.frame
+            ? 'that opening was cut clean — use the rebar cutter on the cage'
+            : 'aim at a slab tile to chip an ingress / camera hole';
+        } else if (!isBroadFace(hitNormal, plan.normal)) {
+          engaged = false;
+          blockReason = 'present the bit to the flat face, not the thin edge';
+        } else {
+          engaged = true;
+          hammerPlanNow = plan;
+          hitPoint.copy(plan.centre);
+        }
+      } else if (hitPart) {
+        engaged = true;   // column / beam — chipBreach falls back to spallAt
+      } else {
+        engaged = false;
+        blockReason = 'aim at concrete to chip';
+      }
     } else if (kind === 'hole') {
       // The cutter bores THROUGH the thickness of one tile, so it needs an intact tile presented
       // face-on. Deciding eligibility here (not in applyEquipment) is what makes a green square
@@ -1111,8 +1306,12 @@ function updateToolAim(clientX, clientY) {
       blockReason = `${tool.label}: no rescuer on site`;
     }
 
-    // Hole footprint only — amber when the tile is fine but he cannot reach it yet.
+    // Footprints: green when right-click will fire, amber when the target is fine but he cannot
+    // reach it yet (or some other gate failed after the target was found).
     if (holePlanNow) showHolePreview(holePlanNow, engaged);
+    else if (hammerPlanNow) showHammerPreview(
+      hammerPlanNow.centre, hammerPlanNow.normal, hammerPlanNow.quat, hammerPlanNow.r, engaged);
+    else if (rebarTarget) showRebarPreview(rebarTarget, engaged);
   }
 
   if (engaged !== wasEngaged && engaged) playContact();   // audible tick as the spot goes live
@@ -1168,6 +1367,14 @@ function refreshEquipmentGate() {
 
 function setEquipment(label) {
   const tool = equipmentByLabel(label);
+  // Vestiges (available: false) stay in EQUIPMENT for revive-later, but cannot be selected
+  // through any path — ring, dropdown, hotkey, or the __app test API.
+  if (tool && tool.available === false) {
+    params.equipment = activeTool ? activeTool.label : 'None';
+    refreshToolRing();
+    setStatus(`${tool.label} is not on the roster (vestigial — kept in code only)`);
+    return;
+  }
   if (tool && !equipmentUnlocked()) {
     // Bounce the selection rather than half-applying it, so params.equipment and the ring stay
     // in step with `activeTool` no matter which of the three entry points asked for the change.
@@ -1178,9 +1385,10 @@ function setEquipment(label) {
   }
   activeTool = tool || null;
   params.equipment = tool ? tool.label : 'None';
-  cutSquare.visible = false;
+  clearToolPreviews();
   engaged = false; wasEngaged = false;
-  aimPoint = null; holePlanNow = null; blockReason = '';
+  aimPoint = null; holePlanNow = null; hammerPlanNow = null; rebarTarget = null; blockReason = '';
+  stopHammerHold();   // never leave the breaker running after a tool swap
   setRaycastLayers();
   refreshToolRing();
   equipTool(tool);
@@ -1189,13 +1397,21 @@ function setEquipment(label) {
   controls.mouseButtons.RIGHT = tool ? null : THREE.MOUSE.PAN;
   if (!tool) { setStatus('tool: none — left-drag orbits'); return; }
   setStatus(`${tool.label} in hand — ${tool.hint}` +
-    (tool.needsReach ? ' Walk within arm\'s reach; RIGHT-CLICK an eligible spot to use.' : ' RIGHT-CLICK to use.'));
+    (tool.holdToUse
+      ? ' HOLD right-click to keep chipping.'
+      : (tool.needsReach ? ' Walk within arm\'s reach; RIGHT-CLICK an eligible spot to use.' : ' RIGHT-CLICK to use.')));
 }
 
 // Use the active tool at the aim point (right-click / Apply / Enter).
 function applyEquipment() {
   if (!sim || !activeTool) return;
   const tool = activeTool;
+  // Hold-to-use tools (demolition hammer) are driven by startHammerHold / updateToolPose, not
+  // a single click — Enter still fires one chip so the GUI "Apply" button stays useful.
+  if (tool.holdToUse && tool.kind === 'hammer') {
+    chipHammerOnce();
+    return;
+  }
   if (!engaged) {
     setStatus(blockReason || `${tool.label}: no eligible spot under the cursor`);
     return;
@@ -1273,24 +1489,126 @@ function applyEquipment() {
     return;
   }
 
-  // torch / pliers / hammer: all one-shot point tools
-  if (tool.kind === 'rebar') tool.reach = params.cutReach;
+  // torch / pliers: one-shot point tools (hammer is hold-to-chip above)
+  if (tool.kind === 'rebar') {
+    tool.reach = params.cutReach;
+    // Square up to the seam before the jaws close — same small correction the cutter does.
+    if (rescuer) rescuer.faceTowards(point.x, point.z);
+  }
   const res = tool.apply(sim, { point });
   if (!res.severed) {
     setStatus(tool.kind === 'rebar'
-      ? 'no exposed rebar in the mouth — hover a fracture between slab pieces'
+      ? 'no exposed rod under the jaws — aim at a visible red bar'
       : `${tool.label}: nothing to act on there`);
     return;
   }
-  grind(300);
+  grind(tool.kind === 'rebar' ? 450 : 300);
+  if (tool.kind === 'rebar') cutUntil = performance.now() + 450;   // viewmodel kick while snipping
   if (res.points[0]) { lastCutWorld.set(res.points[0].x, res.points[0].y, res.points[0].z); addCutMarks(res.points); }
   resume();
-  if (tool.kind === 'hammer') {
-    setStatus(`hammer — concrete spalled${res.spalled ? ' (section lost: buckling capacity down)' : ''}` +
-      `${res.exposed ? ', rebar exposed' : ''}`);
+  if (tool.kind === 'rebar') {
+    setStatus(res.dropped
+      ? `✂ rebar snipped — ${res.dropped} freed bar${res.dropped > 1 ? 's' : ''} falling`
+      : (res.brokeTie
+        ? `✂ rebar snipped — rod severed and fracture hinge broken, ${res.woken ?? 0} pieces re-settling`
+        : `✂ rebar snipped — rod severed, ${res.woken ?? 0} pieces re-settling`));
   } else {
     setStatus(`✂ ${tool.label} — joint severed, ${res.woken ?? 0} pieces re-settling`);
   }
+}
+
+/**
+ * One demolition-hammer chip at the current aim. Called on an interval while RMB is held, and
+ * once from Apply/Enter. Returns true if a chip landed.
+ *
+ * While a hold is in progress we keep chipping the LOCKED tile even if the mouse ray falls
+ * through the opening (otherwise break-through would immediately stop the breaker).
+ */
+function chipHammerOnce() {
+  if (!sim || !activeTool || activeTool.kind !== 'hammer') return false;
+  const part = hammerTargetPart || hitPart;
+  if (!part) {
+    setStatus(blockReason || 'Demolition hammer: no eligible concrete under the bit');
+    return false;
+  }
+
+  // Work point: breach centre once planted, otherwise the live cursor hit.
+  let point;
+  if (part.breach && part.mesh) {
+    part.mesh.updateWorldMatrix(true, false);
+    const faceY = part.breach.faceSign * part.shape.hy;
+    const w = part.mesh.localToWorld(new THREE.Vector3(part.breach.cx, faceY, part.breach.cz));
+    point = { x: w.x, y: w.y, z: w.z };
+  } else if (engaged) {
+    point = { x: hitPoint.x, y: hitPoint.y, z: hitPoint.z };
+  } else {
+    setStatus(blockReason || 'Demolition hammer: no eligible concrete under the bit');
+    return false;
+  }
+
+  // Reach gate against the work point (not whatever the ray hit through the hole).
+  if (activeTool.needsReach) {
+    if (!rescuer) {
+      setStatus('Demolition hammer: no rescuer on site');
+      return false;
+    }
+    const res = reachCheck(rescuer.stance(), point, activeTool.toolLength || 0);
+    if (!res.ok) {
+      setStatus(reachMessage(res, activeTool.label));
+      return false;
+    }
+  }
+
+  if (rescuer) rescuer.faceTowards(point.x, point.z);
+  const res = sim.chipBreach(part, point);
+  if (!res.chipped) {
+    setStatus(res.reason === 'cutter_hole'
+      ? 'that opening was cut clean — use the rebar cutter on the cage'
+      : 'nothing to chip there');
+    return false;
+  }
+  cutUntil = performance.now() + 140;   // short viewmodel kick per strike
+  if (res.holeWorld) {
+    lastCutWorld.set(res.holeWorld.x, res.holeWorld.y, res.holeWorld.z);
+    addCutMarks([res.holeWorld]);
+  }
+  if (part.kind === 'slab') {
+    const plan = planHammer(part, point);
+    if (plan) {
+      hammerPlanNow = plan;
+      showHammerPreview(plan.centre, plan.normal, plan.quat, plan.r, true);
+      hitPoint.copy(plan.centre);
+      aimPoint = plan.centre.clone();
+    }
+  }
+  if (res.justThrough) {
+    resume();
+    setStatus(`⚒ broke through — ⌀ ${(res.radius * 2).toFixed(2)} m opening, rebar still spanning. Keep holding to widen, or switch to Rebar to clear the cage.`);
+  } else if (res.through) {
+    setStatus(`⚒ widening — ⌀ ${(res.radius * 2).toFixed(2)} m through-hole, rebar intact`);
+  } else {
+    setStatus(`⚒ chipping — ${(res.depthFrac * 100).toFixed(0)}% through, ⌀ ${(res.radius * 2).toFixed(2)} m (rebar exposing)`);
+  }
+  return true;
+}
+
+/** Begin hold-to-chip: sound for the whole press; chips tick on the locked tile. */
+function startHammerHold() {
+  if (hammerHeld) return;
+  hammerHeld = true;
+  hammerChipAcc = 0;
+  hammerTargetPart = (engaged && hitPart) ? hitPart : null;
+  ensureAudio();
+  startHammer(Math.round((params.hammerChipInterval || DEFAULTS.hammerChipInterval || 0.16) * 1000 * 0.8));
+  chipHammerOnce();   // immediate first bite so the press is not a dead wait
+}
+
+/** End hold-to-chip and silence the breaker. */
+function stopHammerHold() {
+  hammerHeld = false;
+  hammerChipAcc = 0;
+  hammerTargetPart = null;
+  stopHammer();
 }
 
 // --- per-frame upkeep of everything that ties the tool to the man -----------------------------
@@ -1319,6 +1637,24 @@ function updateToolPose(dt) {
   const cutting = performance.now() < cutUntil ? 1 : 0;
   if (toolActive() && lastPointer.has) updateToolAim(lastPointer.x, lastPointer.y);
 
+  // Demolition hammer: while RMB is held, chip at most ONCE per frame on the locked tile.
+  // A while-burst of chipBreach→onReshape (full rebar merge) was freezing the tab on click.
+  if (hammerHeld && activeTool && activeTool.kind === 'hammer') {
+    const interval = Math.max(0.05, Number(params.hammerChipInterval) || DEFAULTS.hammerChipInterval || 0.16);
+    if (hammerTargetPart || engaged) {
+      if (!hammerTargetPart && engaged && hitPart) hammerTargetPart = hitPart;
+      hammerChipAcc += dt;
+      if (hammerChipAcc >= interval) {
+        hammerChipAcc -= interval;
+        // Cap backlog so a long GC pause cannot enqueue a dozen mesh rebuilds.
+        if (hammerChipAcc > interval) hammerChipAcc = 0;
+        chipHammerOnce();
+      }
+    } else {
+      hammerChipAcc = 0;
+    }
+  }
+
   // Turn toward the work — but only while standing still (walking owns the heading), and only
   // toward a point that ALREADY passed the working-cone test, so auto-turn can never be used to
   // creep round to something behind him.
@@ -1338,9 +1674,25 @@ function resume() { settleDuration = params.cutSettleSeconds; phase = 'collapsin
 renderer.domElement.addEventListener('contextmenu', (e) => { if (toolActive()) e.preventDefault(); });
 renderer.domElement.addEventListener('pointermove', (e) => updateToolAim(e.clientX, e.clientY));
 renderer.domElement.addEventListener('pointerdown', (e) => {
-  // Right-click an eligible spot: the tool is already in his hand, so just cut / place.
-  if (e.button === 2 && toolActive()) { e.preventDefault(); updateToolAim(e.clientX, e.clientY); applyEquipment(); }
+  if (e.button !== 2 || !toolActive()) return;
+  e.preventDefault();
+  // Capture so pointerup still arrives if the cursor leaves the canvas mid-hold — otherwise
+  // hammerHeld stays true and the breaker keeps rebuilding meshes forever (looks like a hang).
+  try { renderer.domElement.setPointerCapture(e.pointerId); } catch (_) { /* older browsers */ }
+  updateToolAim(e.clientX, e.clientY);
+  if (activeTool && activeTool.holdToUse) startHammerHold();
+  else applyEquipment();
 });
+renderer.domElement.addEventListener('pointerup', (e) => {
+  if (e.button === 2) {
+    stopHammerHold();
+    try { renderer.domElement.releasePointerCapture(e.pointerId); } catch (_) { /* not capturing */ }
+  }
+});
+renderer.domElement.addEventListener('pointercancel', () => stopHammerHold());
+renderer.domElement.addEventListener('lostpointercapture', () => stopHammerHold());
+addEventListener('blur', () => stopHammerHold());
+document.addEventListener('visibilitychange', () => { if (document.hidden) stopHammerHold(); });
 
 // --- tool ring HUD (specs.md §4B) -----------------------------------------------------------
 const TOOL_ICONS = {
@@ -1358,7 +1710,8 @@ function buildToolRing() {
     ringEl.appendChild(b);
   };
   mk('None', '✋', '0', null);
-  for (const t of EQUIPMENT) mk(t.short || t.label, TOOL_ICONS[t.kind] || '•', t.key, t);
+  // Only the available roster — vestiges (e.g. Concrete saw) stay out of the ring.
+  for (const t of AVAILABLE_EQUIPMENT) mk(t.short || t.label, TOOL_ICONS[t.kind] || '•', t.key, t);
 }
 function refreshToolRing() {
   const on = equipmentUnlocked();
@@ -1507,10 +1860,12 @@ addEventListener('keydown', (e) => {
   }
   else if (k === 'enter') applyEquipment();
   else if (k === '0') setEquipment('None');
-  else if (k >= '1' && k <= '8') {
-    // 1..8 select a tool. setEquipment itself refuses when no rescuer is on site, so the keyboard
-    // cannot be used to slip past the ring being greyed out.
-    const tool = EQUIPMENT.find((t) => t.key === k);
+  else if (k >= '1' && k <= '7') {
+    // 1..7 select a tool from the available roster. setEquipment itself refuses when no rescuer
+    // is on site, so the keyboard cannot be used to slip past the ring being greyed out.
+    // (Key 8 used to be the ladder when the saw was still on the roster; keys were renumbered
+    // when the saw became a vestige — see equipment.js.)
+    const tool = AVAILABLE_EQUIPMENT.find((t) => t.key === k);
     if (tool) setEquipment(tool.label);
   }
 });
@@ -1631,13 +1986,27 @@ if (location.search.includes('test')) {
     stressOf: (part) => stressOf(part),
     updateStressMap,
     hit: () => ({ x: hitPoint.x, y: hitPoint.y, z: hitPoint.z, part: hitPart ? hitPart.kind : null }),
-    // world point of the first exposed rebar (cracked tie) — for tests
+    // World point on a VISIBLE exposed rod. Prefer cage left in a cut hole (part.frame) and
+    // rods that sit well above the floor — those are what the player actually aims at.
     firstRebar: () => {
-      for (const r of sim.joints) if (r.type === 'tie' && r.cracked && !r.broken && !r.a.dead && !r.b.dead) {
-        const a = r.a.body.translation(), b = r.b.body.translation();
-        return { x: (a.x + b.x) / 2, y: (a.y + b.y) / 2, z: (a.z + b.z) / 2 };
+      const cands = [];
+      for (const p of sim.parts) {
+        if (p.dead || !p.rebarExposed || !p.rebars?.length || !p.mesh) continue;
+        for (const d of p.rebars) {
+          if (!d || d.len < 0.08) continue;
+          p.mesh.updateWorldMatrix(true, false);
+          const w = p.mesh.localToWorld(new THREE.Vector3(d.x, d.y, d.z));
+          if (w.y < 0.15) continue;   // skip bars buried against the ground plane
+          cands.push({
+            x: w.x, y: w.y, z: w.z,
+            score: (p.frame ? 10 : 0) + w.y + d.len * 0.1,
+          });
+        }
       }
-      return null;
+      cands.sort((a, b) => b.score - a.score);
+      if (!cands.length) return null;
+      const pt = { x: cands[0].x, y: cands[0].y, z: cands[0].z };
+      return { ...pt, aim: pt };
     },
     // project a world point to canvas pixel coords — for driving the mouse in tests
     project: (p) => { const v = new THREE.Vector3(p.x, p.y, p.z).project(camera);

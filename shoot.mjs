@@ -103,19 +103,31 @@ await page.screenshot({ path: `${OUT}/cut_4_closeup.png` });
 
 // --- rebar cutter: aim the pliers at an exposed rebar (cracked tie) and screenshot ---
 await page.keyboard.press('v');   // show void markers again off
-// The pliers are not reach-gated yet (equipment.js: needsReach false), so free aim still applies —
-// but they still cannot be SELECTED without a rescuer on site, which the spawn above provides.
+// Rebar cutter is now reach-gated (needsReach: true). Park the rescuer beside the seam so the
+// mouth can engage — free aim no longer applies.
 await page.evaluate(() => { window.__app.setEquipment('Rebar cutter'); });
 const rb = await page.evaluate(() => window.__app.firstRebar());
 if (rb) {
-  await page.evaluate((w) => { const { camera, controls } = window.__app; camera.position.set(w.x + 1.6, w.y + 1.3, w.z + 1.6); controls.target.set(w.x, w.y, w.z); controls.update(); }, rb);
+  await page.evaluate((w) => {
+    const yaw = Math.atan2(-(w.x), -(w.z));
+    // Stand close enough that arm + toolLength cover the seam.
+    window.__app.teleportRescuer({ x: w.x + 0.5, y: w.y, z: w.z + 0.5 }, yaw, false);
+    const { camera, controls } = window.__app;
+    camera.position.set(w.x + 1.6, w.y + 1.3, w.z + 1.6);
+    controls.target.set(w.x, w.y, w.z);
+    controls.update();
+  }, rb);
   await page.waitForTimeout(200);
-  const s = await page.evaluate((w) => window.__app.project(w), rb);   // reproject after camera move
+  const aim = rb.aim || rb;
+  const s = await page.evaluate((w) => window.__app.project(w), aim);
   await page.mouse.move(s.x, s.y); await page.mouse.move(s.x + 2, s.y + 1);
   await page.waitForTimeout(200);
   await page.screenshot({ path: `${OUT}/cut_5_rebar.png` });
-  const eng = await page.evaluate(() => document.getElementById('status')?.textContent);
-  console.log('rebar cutter aimed at exposed rebar @', rb, '| status:', eng);
+  const eng = await page.evaluate(() => ({
+    status: document.getElementById('status')?.textContent,
+    state: window.__app.toolState(),
+  }));
+  console.log('rebar cutter aimed at exposed rebar @', rb, '| engaged:', eng.state.engaged, '| status:', eng.status);
 } else console.log('no exposed rebar found for the rebar-cutter screenshot');
 
 await browser.close();

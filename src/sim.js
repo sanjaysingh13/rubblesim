@@ -123,6 +123,13 @@ export const DEFAULTS = {
   endFixityFree: 2.0,      // Euler K — top unrestrained (slab above gone) = cantilever
   failureProfile: 'softStory',  // 'softStory' | 'pancake' | 'progressive'
   spallOnCut: 0.48,        // fraction of a column's section lost when a tool cuts into it (brittle cover)
+  // Demolition hammer (electric breaker): each held-chip grows a circular breach.
+  hammerChipRadius: 0.035, // metres added to radius per chip
+  hammerChipDepth: 0.04,   // metres of depth per chip
+  hammerStartRadius: 0.10, // first bite
+  hammerMaxRadius: 0.45,   // ingress / camera-drop size cap
+  hammerChipInterval: 0.16,// seconds between chips while RMB held (also used by the renderer)
+
   // void detection
   voidGrid: 9,
   minVoidHeight: 0.9,      // only clearly survivable pockets
@@ -298,6 +305,103 @@ const rotateVec = (q, v) => {
   };
 };
 
+// Inverse rotation: conjugate quaternion (unit quat ⇒ inverse = conjugate).
+const invRotateVec = (q, v) => rotateVec({ x: -q.x, y: -q.y, z: -q.z, w: q.w }, v);
+
+/**
+ * Closest point on a rod descriptor (local-frame cylinder) to a local point, plus distance.
+ * Rods are axis-aligned in the part's local frame: centred at (d.x,d.y,d.z), length d.len.
+ */
+const closestOnRod = (localP, d) => {
+  const half = d.len / 2;
+  const along = Math.max(d[d.axis] - half, Math.min(d[d.axis] + half, localP[d.axis]));
+  const closest = { x: d.x, y: d.y, z: d.z };
+  closest[d.axis] = along;
+  const dist = Math.hypot(localP.x - closest.x, localP.y - closest.y, localP.z - closest.z);
+  return { dist, closest, along };
+};
+
+/**
+ * Split one rod at `along` (coordinate on its axis), leaving a small gap so the snip reads.
+ * Returns 0–2 stub descriptors to replace the original.
+ */
+const snipRodDescriptor = (d, along, gap = 0.05) => {
+  const half = d.len / 2;
+  const lo = d[d.axis] - half, hi = d[d.axis] + half;
+  const cutLo = along - gap / 2, cutHi = along + gap / 2;
+  const stubs = [];
+  const minLen = 0.04;   // discard stubs shorter than this — they read as dust, not bar
+  if (cutLo - lo >= minLen) {
+    stubs.push({ ...d, [d.axis]: (lo + cutLo) / 2, len: cutLo - lo });
+  }
+  if (hi - cutHi >= minLen) {
+    stubs.push({ ...d, [d.axis]: (cutHi + hi) / 2, len: hi - cutHi });
+  }
+  return stubs;
+};
+
+/** Endpoints of a rod descriptor in the part's local frame. */
+const rodEnds = (d) => {
+  const half = d.len / 2;
+  const a = { x: d.x, y: d.y, z: d.z };
+  const b = { x: d.x, y: d.y, z: d.z };
+  a[d.axis] -= half;
+  b[d.axis] += half;
+  return [a, b];
+};
+
+/**
+ * Does this part have an OPENING where rebar can span free of concrete?
+ * Hammer breaches (through) and cutter holes both qualify.
+ */
+const hasRebarOpening = (part) => !!(part && (part.hole || (part.breach && part.breach.through)));
+
+/** True if local (x,z) lies inside the part's open hole / breach footprint. */
+const inOpeningXZ = (part, x, z) => {
+  if (part.breach && part.breach.through) {
+    const b = part.breach;
+    const dx = x - b.cx, dz = z - b.cz;
+    return dx * dx + dz * dz <= b.r * b.r;
+  }
+  if (part.hole) {
+    const h = part.hole;
+    return Math.abs(x - h.cx) <= h.rx && Math.abs(z - h.cz) <= h.rz;
+  }
+  return false;
+};
+
+/**
+ * A rod is "anchored" if any of it still sits in remaining concrete (outside the opening).
+ * Fully-in-opening rods are only held up by connection to other rods.
+ */
+const rodAnchoredInConcrete = (part, d) => {
+  if (!hasRebarOpening(part)) return true;   // no opening → everything is embedded
+  const [a, b] = rodEnds(d);
+  // Sample ends + centre — enough for axis-aligned bars.
+  if (!inOpeningXZ(part, a.x, a.z)) return true;
+  if (!inOpeningXZ(part, b.x, b.z)) return true;
+  if (!inOpeningXZ(part, d.x, d.z)) return true;
+  return false;
+};
+
+/** Minimum distance between two axis-aligned rod segments (local frame). */
+const rodRodDistance = (a, b) => {
+  const [a0, a1] = rodEnds(a);
+  const [b0, b1] = rodEnds(b);
+  // Clamp each segment's closest approach along the three axes independently for AA segs.
+  // Exact segment–segment distance for axis-aligned cases:
+  const ax0 = Math.min(a0.x, a1.x), ax1 = Math.max(a0.x, a1.x);
+  const ay0 = Math.min(a0.y, a1.y), ay1 = Math.max(a0.y, a1.y);
+  const az0 = Math.min(a0.z, a1.z), az1 = Math.max(a0.z, a1.z);
+  const bx0 = Math.min(b0.x, b1.x), bx1 = Math.max(b0.x, b1.x);
+  const by0 = Math.min(b0.y, b1.y), by1 = Math.max(b0.y, b1.y);
+  const bz0 = Math.min(b0.z, b1.z), bz1 = Math.max(b0.z, b1.z);
+  const dx = Math.max(0, Math.max(ax0 - bx1, bx0 - ax1));
+  const dy = Math.max(0, Math.max(ay0 - by1, by0 - ay1));
+  const dz = Math.max(0, Math.max(az0 - bz1, bz0 - az1));
+  return Math.hypot(dx, dy, dz);
+};
+
 export class RubbleSim {
   constructor(RAPIER, opts = {}, callbacks = {}) {
     this.R = RAPIER;
@@ -306,6 +410,8 @@ export class RubbleSim {
     this.onRemove = callbacks.onRemove || (() => {});
     this.onReshape = callbacks.onReshape || (() => {}); // renderer rebuilds a part's mesh after a hole is cut
     this.onExpose = callbacks.onExpose || (() => {});   // renderer skins concrete when rebar is revealed
+    // Renderer rebuilds ONLY the rebar child mesh after a rod is snipped (concrete shell unchanged).
+    this.onRebarChange = callbacks.onRebarChange || (() => {});
     this.onSplinter = callbacks.onSplinter || (() => {}); // visual-only cement chips at a fracture
     this.phase = 'idle';
     this._init();
@@ -1261,8 +1367,18 @@ export class RubbleSim {
     return { severed, woken, points };
   }
 
-  // Exposed rebar = a cracked tie hinge (the rebar bridging a fracture between two slab
-  // pieces). Return the nearest one to `point` within `reach`, or null.
+  // Exposed rebar TARGETING — two related notions live together:
+  //
+  //   1. VISUAL rods (`part.rebars` on a part with `rebarExposed`) — the rust-red cylinders the
+  //      player sees in a cut hole, at a fractured edge, or through skinned concrete. The
+  //      hydraulic snips aim at these.
+  //   2. CRACKED TIE hinges — the structural "rebar bridge" between two slab pieces at a
+  //      fracture. Snipping near one also breaks the hinge so the pieces can separate.
+  //
+  // `exposedRebarNear` keeps the hinge lookup (torch / legacy). `exposedRodNear` finds a
+  // visible rod. `cutRebar` does both: severs the rod visually and breaks a nearby hinge.
+
+  // Cracked-tie hinge nearest `point` within `reach`, or null.
   exposedRebarNear(point, reach) {
     let best = null, bd = reach * reach;
     for (const rec of this.joints) {
@@ -1276,23 +1392,188 @@ export class RubbleSim {
     return best;
   }
 
-  // Hydraulic rebar cutter: snip the exposed rebar nearest `point` — breaks that hinge so the
-  // two slab pieces separate — then wake the local region so they shift. Returns {severed,points,woken}.
+  // Nearest VISIBLE rod on any rebarExposed part, within `reach` of `point` (world).
+  // Returns { part, index, world, local, along, dist } or null.
+  exposedRodNear(point, reach) {
+    let best = null;
+    for (const part of this.parts) {
+      if (part.dead || !part.rebarExposed || !part.rebars || !part.rebars.length) continue;
+      const t = part.body.translation(), q = part.body.rotation();
+      const localP = invRotateVec(q, { x: point.x - t.x, y: point.y - t.y, z: point.z - t.z });
+      for (let i = 0; i < part.rebars.length; i++) {
+        const d = part.rebars[i];
+        if (!d || d.len < 0.04) continue;
+        const hit = closestOnRod(localP, d);
+        // Accept if within reach of the rod surface (distance to axis minus radius).
+        const gap = Math.max(0, hit.dist - (d.r || 0));
+        if (gap > reach) continue;
+        if (best && gap >= best.dist) continue;
+        const worldOff = rotateVec(q, hit.closest);
+        best = {
+          part, index: i, along: hit.along, dist: gap,
+          local: hit.closest,
+          world: { x: t.x + worldOff.x, y: t.y + worldOff.y, z: t.z + worldOff.z },
+        };
+      }
+    }
+    return best;
+  }
+
+  // Hydraulic rebar cutter: snip the exposed ROD nearest `point` (the red bar the player aims
+  // at — in a hole, at a frayed edge, anywhere the lattice is visible). If a cracked-tie hinge
+  // is also within reach, break it so fractured pieces can separate.
+  //
+  // After a snip, any rod (or connected cage island) that no longer reaches concrete-anchored
+  // bars — e.g. a segment cut free on both sides inside a hammered opening — is spawned as
+  // falling debris instead of floating forever as a child of the slab mesh.
   cutRebar(point, reach) {
-    const near = this.exposedRebarNear(point, reach);
-    if (!near) return { severed: 0, points: [], woken: 0 };
-    this._breakJoint(near.rec);
+    const rod = this.exposedRodNear(point, reach);
+    const tie = this.exposedRebarNear(point, reach);
+    if (!rod && !tie) {
+      return { severed: 0, points: [], woken: 0, snippedRod: false, brokeTie: false, dropped: 0 };
+    }
+
+    let snippedRod = false, brokeTie = false;
+    const points = [];
+    let dropHost = null;
+
+    if (rod) {
+      const d = rod.part.rebars[rod.index];
+      const stubs = snipRodDescriptor(d, rod.along, Math.max(0.04, (d.r || 0.008) * 4));
+      // Replace the one rod with its stubs (or nothing if both ends were too short).
+      rod.part.rebars = rod.part.rebars.filter((_, i) => i !== rod.index).concat(stubs);
+      snippedRod = true;
+      dropHost = rod.part;
+      points.push(rod.world);
+    }
+
+    if (tie) {
+      this._breakJoint(tie.rec);
+      brokeTie = true;
+      if (!points.length) points.push({ x: tie.x, y: tie.y, z: tie.z });
+    }
+
+    // Drop any cage island that the snip just freed from concrete.
+    let dropped = 0;
+    if (dropHost) {
+      dropped = this._dropLooseRebar(dropHost);
+      this.onRebarChange(dropHost);
+    }
+
+    const focus = points[0];
     const R = this.R, wake = Math.max(reach * 3, 1.5);
     let woken = 0;
     for (const p of this.parts) {
       if (p.dead) continue;
       const t = p.body.translation();
-      if (Math.hypot(t.x - near.x, t.y - near.y, t.z - near.z) <= wake) {
+      if (Math.hypot(t.x - focus.x, t.y - focus.y, t.z - focus.z) <= wake) {
         p.body.setBodyType(R.RigidBodyType.Dynamic, true); p.body.wakeUp(); p.fixed = false; woken++;
       }
     }
     this.stats.cuts++; this.phase = 'collapsing';
-    return { severed: 1, points: [{ x: near.x, y: near.y, z: near.z }], woken };
+    return { severed: 1, points, woken, snippedRod, brokeTie, dropped };
+  }
+
+  /**
+   * Find rods on `part` that are no longer connected (via the remaining lattice) to any bar
+   * still embedded in concrete. Those float free inside an opening after both-side snips —
+   * spawn each as a dynamic fragment and remove it from the parent cage.
+   *
+   * Support rules (USAR-gameplay, not full weld FEM):
+   *   • Two rods BOTH fully in the opening may brace each other (a free cage island).
+   *   • A void rod is only held to concrete by a SAME-AXIS continuation into an anchored
+   *     stub — a crossing bar that still runs into the frame does not by itself keep a
+   *     segment that has been snipped on both sides from falling.
+   * Returns the number of debris pieces spawned.
+   */
+  _dropLooseRebar(part) {
+    if (!part?.rebars?.length || !hasRebarOpening(part)) return 0;
+    const rods = part.rebars;
+    const n = rods.length;
+    const th = this.opts.rebarThickness ?? 0.008;
+    // Must be smaller than the snip gap (~0.04–0.05 m) so a cut disconnects two stubs.
+    const tol = th * 2.5 + 0.008;
+
+    const anchored = rods.map((d) => rodAnchoredInConcrete(part, d));
+    const colinearTouch = (a, b) => {
+      if (a.axis !== b.axis) return false;
+      const ax = a.axis;
+      for (const o of ['x', 'y', 'z']) {
+        if (o === ax) continue;
+        if (Math.abs(a[o] - b[o]) > tol) return false;
+      }
+      return rodRodDistance(a, b) <= tol;
+    };
+    const linked = (i, j) => {
+      const a = rods[i], b = rods[j];
+      const da = rodRodDistance(a, b);
+      if (da > tol) return false;
+      const ai = anchored[i], aj = anchored[j];
+      // Free–free: full cage connectivity inside the void (crossing bars included).
+      if (!ai && !aj) return true;
+      // Into concrete: only an end-to-end continuation of the same bar.
+      return colinearTouch(a, b);
+    };
+
+    const adj = Array.from({ length: n }, () => []);
+    for (let i = 0; i < n; i++) {
+      for (let j = i + 1; j < n; j++) {
+        if (linked(i, j)) { adj[i].push(j); adj[j].push(i); }
+      }
+    }
+
+    const reach = new Array(n).fill(false);
+    const stack = [];
+    for (let i = 0; i < n; i++) {
+      if (anchored[i]) { reach[i] = true; stack.push(i); }
+    }
+    while (stack.length) {
+      const i = stack.pop();
+      for (const j of adj[i]) {
+        if (!reach[j]) { reach[j] = true; stack.push(j); }
+      }
+    }
+
+    const keep = [];
+    const drop = [];
+    for (let i = 0; i < n; i++) {
+      if (reach[i]) keep.push(rods[i]);
+      else drop.push(rods[i]);
+    }
+    if (!drop.length) return 0;
+
+    part.rebars = keep;
+    let spawned = 0;
+    for (const d of drop) {
+      if (this._spawnRebarDebris(part, d)) spawned++;
+    }
+    return spawned;
+  }
+
+  /**
+   * Spawn one falling rebar fragment: a thin dynamic box carrying a single rod descriptor,
+   * inheriting the parent slab's momentum so it doesn't freeze in mid-air.
+   */
+  _spawnRebarDebris(parent, d) {
+    const t = parent.body.translation(), q = parent.body.rotation();
+    const woff = rotateVec(q, { x: d.x, y: d.y, z: d.z });
+    const wpos = { x: t.x + woff.x, y: t.y + woff.y, z: t.z + woff.z };
+    const r = Math.max(0.006, d.r || this.opts.rebarThickness || 0.008);
+    // Thin cuboid along the rod axis — cheap collider, reads as a bar with the rebar child mesh.
+    const shape = { hx: r * 1.2, hy: r * 1.2, hz: r * 1.2 };
+    if (d.axis === 'x') shape.hx = d.len / 2;
+    else if (d.axis === 'y') shape.hy = d.len / 2;
+    else shape.hz = d.len / 2;
+    const localRod = { ...d, x: 0, y: 0, z: 0 };
+    const frag = this._addBox(shape, wpos, q, 'fragment', {
+      fixed: false,
+      density: this.opts.densitySteel,
+      rebars: [localRod],
+    });
+    if (!frag) return null;
+    this._inheritMomentum(parent.body, frag.body, wpos);
+    this._exposeRebar(frag);
+    return frag;
   }
 
   // ---- momentum-preserving severing (specs.md §3.1.3) ---------------------
@@ -1372,11 +1653,163 @@ export class RubbleSim {
   }
 
   /**
-   * Breaching hammer: spall the concrete at a point. Physically this removes section rather than
-   * severing anything, so its real consequence is structural, not visual — a spalled column has
-   * less area AND (because I ∝ A² for a square section) far less buckling capacity, which the
-   * FrameModel picks up on its next evaluation. It also cracks the nearest seam, exposing rebar
-   * for the pliers. Returns {spalled, exposed, part}.
+   * Open or enlarge a through-hole FRAME on a slab without touching rebar.
+   * Used by the demolition hammer: concrete is removed, the rust lattice stays so the
+   * rebar cutter can clear the opening as a second pass. Unlike cutHoleInSlab there is
+   * no falling plug — the hammer pulverises the concrete into dust/chips.
+   */
+  _applyBreachFrame(slab, holeCx, holeCz, r) {
+    const R = this.R, o = this.opts, s = slab.shape;
+    const m = 0.06;
+    let rx = Math.min(r, s.hx - m), rz = Math.min(r, s.hz - m);
+    if (rx <= 0.02 || rz <= 0.02) return false;
+    holeCx = Math.max(-s.hx + rx + m, Math.min(s.hx - rx - m, holeCx));
+    holeCz = Math.max(-s.hz + rz + m, Math.min(s.hz - rz - m, holeCz));
+
+    const frame = [
+      { hx: (holeCx - rx + s.hx) / 2, hy: s.hy, hz: s.hz, x: (-s.hx + holeCx - rx) / 2, y: 0, z: 0 },
+      { hx: (s.hx - holeCx - rx) / 2, hy: s.hy, hz: s.hz, x: (s.hx + holeCx + rx) / 2, y: 0, z: 0 },
+      { hx: rx, hy: s.hy, hz: (holeCz - rz + s.hz) / 2, x: holeCx, y: 0, z: (-s.hz + holeCz - rz) / 2 },
+      { hx: rx, hy: s.hy, hz: (s.hz - holeCz - rz) / 2, x: holeCx, y: 0, z: (s.hz + holeCz + rz) / 2 },
+    ].filter((b) => b.hx > 0.02 && b.hz > 0.02);
+
+    for (const c of slab.colliders) { this.colliderToPart.delete(c.handle); this.world.removeCollider(c, true); }
+    slab.colliders = [];
+    for (const b of frame) {
+      const cd = R.ColliderDesc.cuboid(b.hx, b.hy, b.hz).setTranslation(b.x, b.y, b.z)
+        .setRestitution(o.restitution).setFriction(o.friction).setDensity(o.densityConcrete);
+      const c = this.world.createCollider(cd, slab.body);
+      slab.colliders.push(c);
+      this.colliderToPart.set(c.handle, slab);
+    }
+    slab.col = slab.colliders[0] || null;
+    slab.frame = frame;
+    // Intentionally do NOT clip or extract rebar — the cage spans the opening.
+    this.onReshape(slab);
+    return true;
+  }
+
+  /**
+   * Demolition hammer (electric breaker): one CHIP of a progressive circular breach.
+   *
+   * Hold-to-use from the renderer calls this repeatedly. Each chip:
+   *   • widens the footprint and deepens the pocket;
+   *   • exposes the rebar cage but never severs rods (rebar cutter clears them later);
+   *   • once depth reaches the tile thickness, opens a through-hole in the colliders
+   *     (ingress / camera drop) while leaving the lattice across the opening;
+   *   • further chips keep enlarging that hole up to hammerMaxRadius.
+   *
+   * Columns/beams fall back to a single spallAt (section loss + expose). Returns a report
+   * the HUD can read: { chipped, through, radius, depth, depthFrac, part, reason? }.
+   */
+  chipBreach(part, worldPoint) {
+    if (!part || part.dead) return { chipped: false, reason: 'no_target' };
+
+    // Non-slab: one spall bite (section damage on columns, expose rebar).
+    if (part.kind !== 'slab') {
+      const res = this.spallAt(worldPoint, 0.55);
+      return {
+        chipped: !!(res.spalled || res.exposed), through: false,
+        radius: 0, depth: 0, depthFrac: 0, part: res.part, spalled: res.spalled,
+      };
+    }
+
+    // A clean cutter hole already removed the concrete AND trimmed the cage — hammering
+    // there has nothing left to chip. (A hammer-made breach carries part.breach.)
+    if (part.frame && !part.breach) {
+      return { chipped: false, reason: 'cutter_hole', part };
+    }
+
+    const o = this.opts, s = part.shape;
+    const thickness = s.hy * 2;
+    const t = part.body.translation(), q = part.body.rotation();
+    const local = invRotateVec(q, {
+      x: worldPoint.x - t.x, y: worldPoint.y - t.y, z: worldPoint.z - t.z,
+    });
+
+    let b = part.breach;
+    let rBefore = 0;
+    if (!b) {
+      // First bite: plant the centre under the tip, start a small shallow crater.
+      const r0 = o.hammerStartRadius ?? 0.10;
+      const border = 0.06;
+      const cx = Math.max(-s.hx + r0 + border, Math.min(s.hx - r0 - border, local.x));
+      const cz = Math.max(-s.hz + r0 + border, Math.min(s.hz - r0 - border, local.z));
+      b = part.breach = {
+        cx, cz,
+        r: r0,
+        depth: o.hammerChipDepth ?? 0.04,
+        faceSign: local.y >= 0 ? 1 : -1,
+        through: false,
+        chips: 1,
+      };
+      rBefore = 0;
+    } else {
+      rBefore = b.r;
+      const maxR = o.hammerMaxRadius ?? 0.45;
+      b.r = Math.min(maxR, b.r + (o.hammerChipRadius ?? 0.035));
+      b.depth = Math.min(thickness, b.depth + (o.hammerChipDepth ?? 0.04));
+      b.chips++;
+      // Keep the growing circle inside the tile border.
+      const border = 0.06;
+      b.cx = Math.max(-s.hx + b.r + border, Math.min(s.hx - b.r - border, b.cx));
+      b.cz = Math.max(-s.hz + b.r + border, Math.min(s.hz - b.r - border, b.cz));
+    }
+
+    // Rebar stays; only the concrete cover is broken away → cage becomes visible.
+    this._exposeRebar(part);
+
+    // Dust + a few visual chips at the work point (no physics bodies).
+    const faceY = b.faceSign * s.hy;
+    const woff = rotateVec(q, { x: b.cx, y: faceY, z: b.cz });
+    const wc = { x: t.x + woff.x, y: t.y + woff.y, z: t.z + woff.z };
+    this._emitDust(wc.x, wc.y, wc.z, 8, 0.35);
+    // Splinters only while still pocketing — once the frame rebuilds they would be discarded
+    // anyway, and spawning them every chip added needless mesh churn.
+    if (!b.through) {
+      const chipSize = 0.03 + b.r * 0.04;
+      this.onSplinter([{
+        x: wc.x, y: wc.y, z: wc.z,
+        hx: chipSize * 0.6, hy: chipSize * 0.4, hz: chipSize * 0.5,
+        rx: Math.random() * Math.PI, ry: Math.random() * Math.PI, rz: Math.random() * Math.PI,
+      }], part);
+    }
+
+    const wasThrough = b.through;
+    if (!b.through && b.depth >= thickness * 0.92) {
+      b.through = true;
+    }
+    // Open / enlarge the collider frame only when the opening actually changes. Rebuilding the
+    // mesh (and merging the whole rebar lattice) on every chip was freezing the tab.
+    const grew = b.r > rBefore + 1e-6;
+    const needFrame = b.through && (!wasThrough || grew);
+    if (needFrame) {
+      this._applyBreachFrame(part, b.cx, b.cz, b.r);
+      if (!wasThrough) {
+        this._wakeNear(wc, o.wakeRadius);
+        this.phase = 'collapsing';
+      }
+    }
+
+    this.stats.cuts++;
+    const depthFrac = Math.min(1, b.depth / thickness);
+    return {
+      chipped: true,
+      through: b.through,
+      justThrough: b.through && !wasThrough,
+      radius: b.r,
+      depth: b.depth,
+      depthFrac,
+      chips: b.chips,
+      part,
+      holeWorld: wc,
+      enlarged: needFrame && wasThrough,
+    };
+  }
+
+  /**
+   * Legacy one-shot spall (columns / non-progressive use). The demolition hammer uses
+   * chipBreach for slabs; this remains for member section damage and as a fallback.
    */
   spallAt(point, radius) {
     let target = null, bd = radius * radius;
@@ -1396,11 +1829,9 @@ export class RubbleSim {
         spalled = true;
       }
     }
-    // expose rebar at the nearest intact seam so the crew has something to cut
     const rec = this.joints.find((r) => r.type === 'tie' && !r.cracked && !r.broken &&
       !r.a.dead && !r.b.dead && (r.a === target || r.b === target));
     if (rec) this._crackTie(rec);
-    // hammer chips the face even without a seam crack — skin the concrete so the cage shows
     this._exposeRebar(target);
     this._wakeNear(point, this.opts.wakeRadius);
     this.stats.cuts++;
@@ -1512,6 +1943,7 @@ export class RubbleSim {
     }
     slab.col = slab.colliders[0] || null;
     slab.frame = frame;                                    // renderer rebuilds mesh from this
+    slab.hole = { cx: holeCx, cz: holeCz, rx, rz };        // footprint for loose-rebar drop tests
     // keep the rebar but trim it to the hole -> frayed ends stick into the opening;
     // the cut-out middle of the lattice rides with the plug
     const plugRebars = extractRebarForHole(slab.rebars, holeCx, holeCz, rx, rz);
