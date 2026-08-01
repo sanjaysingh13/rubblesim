@@ -8,7 +8,7 @@
     "dev": "vite",
     "build": "vite build",
     "preview": "vite preview --host",
-    "verify": "node verify-params.mjs && node verify.mjs && node verify-cut.mjs && node verify-hole.mjs && node verify-rebar.mjs && node verify-lift.mjs && node verify-shore.mjs && node verify-equilibrium.mjs && node verify-rescuer.mjs && node verify-reach.mjs",
+    "verify": "node verify-params.mjs && node verify.mjs && node verify-cut.mjs && node verify-hole.mjs && node verify-hammer.mjs && node verify-rebar.mjs && node verify-rebar-fall.mjs && node verify-lift.mjs && node verify-shore.mjs && node verify-equilibrium.mjs && node verify-rescuer.mjs && node verify-reach.mjs",
     "measure": "node measure.mjs",
     "shoot": "node shoot.mjs && node shoot-ui.mjs && node shoot-tooling.mjs"
   },
