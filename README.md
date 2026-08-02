@@ -4,10 +4,14 @@ Browser-based Urban Search & Rescue rubble simulator — **the primary, go-forwa
 implementation**. Models and collapses multi-story buildings, then detects the
 confined-space voids (survivable pockets) inside the resulting rubble.
 
+**Live: https://sanjaysingh13.github.io/rubblesim/** — deployed from `main` on every push.
+
 Built with [three.js](https://threejs.org) (rendering) and
-[Rapier](https://rapier.rs) (WASM rigid-body physics). The original Unity project
-(`../`) is kept only as a reference for ideas and higher-fidelity rendering; all new
-development happens here.
+[Rapier](https://rapier.rs) (WASM rigid-body physics). This started as the `web/`
+subdirectory of the Unity project
+[`rubble_pile_simulator`](https://github.com/sanjaysingh13/rubble_pile_simulator), which is
+kept only as a reference for ideas and higher-fidelity rendering; the commit history from
+that period is preserved here.
 
 > Status: proof-of-concept. Single-page, **100% client-side** — no backend, no
 > accounts, no server-side state. Exports (STL / voids JSON) are browser downloads.
@@ -31,7 +35,8 @@ development happens here.
 ## Quick start (local)
 
 ```bash
-cd web
+git clone git@github.com:sanjaysingh13/rubblesim.git
+cd rubblesim
 npm install
 npm run dev        # → http://localhost:5173
 ```
@@ -66,13 +71,12 @@ publish directory: `dist`.
 
 ### Netlify
 
-`web/netlify.toml`:
+`netlify.toml`:
 
 ```toml
 [build]
-  base    = "web"
   command = "npm ci && npm run build"
-  publish = "web/dist"
+  publish = "dist"
 
 [[headers]]
   for = "/assets/*"
@@ -87,7 +91,7 @@ publish directory: `dist`.
 
 ### Vercel
 
-`web/vercel.json`:
+`vercel.json`:
 
 ```json
 {
@@ -100,25 +104,27 @@ publish directory: `dist`.
 }
 ```
 
-Set the project **Root Directory** to `web` in the Vercel dashboard.
+The repo root is the project root, so no **Root Directory** override is needed.
 
 ### Cloudflare Pages
 
 - Build command: `npm ci && npm run build`
 - Build output directory: `dist`
-- Root directory: `web`
 
 No extra config needed; Pages serves the static bundle directly.
 
-### GitHub Pages (via Actions)
+### GitHub Pages (via Actions) — this is what the live site uses
 
-`.github/workflows/deploy.yml` (repo root):
+Already wired up in [`.github/workflows/deploy.yml`](.github/workflows/deploy.yml): every push
+to `main` runs `npm ci && npm run build` and publishes `dist/` to Pages. Set
+**Settings → Pages → Source** to *GitHub Actions* (once), and that's it.
 
 ```yaml
-name: Deploy web
+name: Deploy to GitHub Pages
 on:
   push:
-    branches: [rescue-training]   # adjust to your default/deploy branch
+    branches: [main]
+  workflow_dispatch:
 permissions:
   contents: read
   pages: write
@@ -126,16 +132,15 @@ permissions:
 jobs:
   build:
     runs-on: ubuntu-latest
-    defaults: { run: { working-directory: web } }
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
-        with: { node-version: 20, cache: npm, cache-dependency-path: web/package-lock.json }
+        with: { node-version: 20, cache: npm, cache-dependency-path: package-lock.json }
       - run: npm ci
-      - run: node verify.mjs           # headless physics smoke test
+        env: { PLAYWRIGHT_SKIP_BROWSER_DOWNLOAD: '1' }   # CI only needs the build
       - run: npm run build
       - uses: actions/upload-pages-artifact@v3
-        with: { path: web/dist }
+        with: { path: dist }
   deploy:
     needs: build
     runs-on: ubuntu-latest
@@ -145,11 +150,13 @@ jobs:
         uses: actions/deploy-pages@v4
 ```
 
-Because `base` is relative, this works at `https://<user>.github.io/<repo>/` unchanged.
+Because `base` is relative, this works at `https://<user>.github.io/<repo>/` unchanged. The
+build step alone is run in CI; the physics suites are a local pre-commit gate (see below) —
+add `- run: npm run verify` here if you want deploys blocked on them.
 
 ### Docker + nginx (self-hosted)
 
-`web/Dockerfile`:
+`Dockerfile`:
 
 ```dockerfile
 # build
@@ -167,7 +174,7 @@ COPY nginx.conf /etc/nginx/conf.d/default.conf
 EXPOSE 80
 ```
 
-`web/nginx.conf`:
+`nginx.conf`:
 
 ```nginx
 server {
@@ -189,8 +196,8 @@ server {
 ```
 
 ```bash
-docker build -t rubblesim-web web
-docker run --rm -p 8080:80 rubblesim-web    # → http://localhost:8080
+docker build -t rubblesim .
+docker run --rm -p 8080:80 rubblesim    # → http://localhost:8080
 ```
 
 ### Amazon S3 + CloudFront (or any object store + CDN)
@@ -250,16 +257,31 @@ bundle. Test before enforcing; tighten as the app grows.
 
 ## CI verification
 
-`verify.mjs` runs the collapse + void-detection pipeline **headless in Node** (Rapier runs
-without a browser) — a fast, deterministic smoke test with no WebGL needed:
+Rapier runs in Node, so the whole physics core is testable **headless, with no WebGL** — the
+renderer is the only part that needs a browser. That split is the reason `src/sim.js` is
+framework-agnostic.
 
 ```bash
-node verify.mjs        # exits 0 on PASS, 1 on FAIL
+npm run verify     # 12 suites, exits 0 on PASS and 1 on the first FAIL
+npm run measure    # threshold measurement rig (mode=force | mode=folds)
+npm run shoot      # Playwright drivers — needs `npm run dev` in another shell
 ```
 
-It builds a 4-story structure, collapses it, settles the physics, and asserts that
-internal (buried) voids are detected. Wire it into CI before the build step (see the
-GitHub Actions example above).
+`npm run verify` chains, in order: `verify-params` (every `gui.add` binding resolves — a
+missing one throws in lil-gui and black-screens the app), `verify` (collapse settles with
+fractures and buried voids), `verify-cut` / `verify-hole` / `verify-hammer` (the three ways
+concrete is opened), `verify-rebar` / `verify-rebar-fall` (snips, and freed rods dropping),
+`verify-lift` / `verify-shore` (bag stall and shoring relief, in real kN), `verify-equilibrium`
+(no piece is left floating; freeze moves nothing), and `verify-rescuer` / `verify-reach` (agent
+locomotion and the tool reach envelope).
+
+Every suite ends with an **explosion guard** — any piece past ~60 m fails the run. Solver
+instability shows up as coordinates in the thousands, and it is much cheaper to catch there
+than by eye.
+
+`npm run shoot` is the browser half: a `vite build` passing does **not** mean the page runs.
+Only the Playwright drivers catch load-time exceptions and invisible-geometry bugs; they fail
+the run on any `pageerror`.
 
 ---
 
@@ -308,25 +330,33 @@ Requires an evergreen browser (Chrome/Edge/Firefox/Safari, ~2021+):
 ## Project layout
 
 ```
-web/
-├── index.html          # app shell + HUD + tool ring
-├── vite.config.js      # base './', esnext target
-├── package.json        # npm run dev | build | verify | measure | shoot
-├── measure.mjs         # threshold measurement rig (mode=force | mode=folds)
-├── verify*.mjs         # headless CI tests — drive sim.js, no browser
-├── shoot*.mjs          # Playwright drivers — catch load-time / invisible-geometry bugs
+rubblesim/
+├── index.html                # app shell + HUD + tool ring
+├── vite.config.js            # base './', esnext target
+├── package.json              # npm run dev | build | verify | measure | shoot
+├── measure.mjs               # threshold measurement rig (mode=force | mode=folds)
+├── verify*.mjs               # headless tests — drive sim.js, no browser
+├── shoot*.mjs                # Playwright drivers — load-time / invisible-geometry bugs
+├── .github/workflows/        # deploy.yml → build + publish dist/ to Pages on push to main
+├── DEVLOG.md                 # why the code is the way it is — read before re-deriving
 └── src/
-    ├── sim.js          # physics core (framework-agnostic): build → collapse →
-    │                   #   crack/snap/tear → settle → detect internal voids.
-    │                   #   Shared by main.js and every verify*.mjs.
-    ├── structure.js    # structural engineering layer: tributary loads, axial crush +
-    │                   #   Euler buckling, progressive redistribution (FrameModel);
-    │                   #   contact-graph load paths through the pile (DebrisSupport)
-    ├── rescue.js       # lifting bags + shoring, and their capacity/stall physics
-    ├── equipment.js    # tool registry = the active-tool enum + raycast pick rules
-    ├── main.js         # renderer: mirrors each sim part as a three.js mesh + GUI + HUD
-    ├── audio.js        # Web Audio contact tick / grind (no assets)
-    └── rng.js          # seeded deterministic RNG (mirrors -randomseed)
+    ├── sim.js                # physics core (framework-agnostic): build → collapse →
+    │                         #   crack/snap/tear → settle → contact-based equilibrium →
+    │                         #   detect internal voids. Shared by main.js and every verify.
+    ├── structure.js          # structural engineering layer: tributary loads, axial crush +
+    │                         #   Euler buckling, progressive redistribution (FrameModel);
+    │                         #   contact-graph load paths through the pile (DebrisSupport)
+    ├── rescue.js             # lifting bags + shoring, and their capacity/stall physics
+    ├── equipment.js          # tool registry = the active-tool enum + raycast pick rules
+    ├── rescuer.js            # the agent: Rapier KCC capsule, walk / jump / mantle / ladder
+    ├── rescuer-reach.js      # shoulder-centred reach sphere — pure geometry, so both the
+    │                         #   renderer and the headless tests can use it
+    ├── rescuer-mesh.js       # procedural Civil Defence humanoid (no GLTF, no textures)
+    ├── rescuer-constants.js  # body dimensions and mass — in TONNES, like the rest of the sim
+    ├── tool-mesh.js          # procedural tool props: in-hand (3rd person) and viewmodel (1st)
+    ├── main.js               # renderer: mirrors each sim part as a three.js mesh + GUI + HUD
+    ├── audio.js              # Web Audio contact tick / grind / hammer (no assets)
+    └── rng.js                # seeded deterministic RNG (mirrors -randomseed)
 ```
 
 ### Units
