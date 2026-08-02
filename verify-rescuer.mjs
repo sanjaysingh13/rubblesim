@@ -6,9 +6,12 @@ import { RubbleSim } from './src/sim.js';
 import {
   RescuerAgent, mantleRiseOk, agentTriggersCompromise, slopeOk,
   MANTLE_MIN, MANTLE_MAX, ACCESS_RADIUS, MAX_JUMP_LAND_H, MAX_HOLE_DROP, MAX_GRAB_H,
-  JUMP_SPEED, GRAVITY,
+  JUMP_SPEED, GRAVITY, COMMIT_DURATION, COMMIT_REACH, PRONE_SPEED,
 } from './src/rescuer.js';
-import { CAPSULE_HALF, CAPSULE_RADIUS } from './src/rescuer-constants.js';
+import {
+  CAPSULE_HALF, CAPSULE_RADIUS, CROUCH_HEIGHT, PRONE_HEIGHT,
+} from './src/rescuer-constants.js';
+import { clearanceToVictim } from './src/confined-access.js';
 
 let failed = 0;
 function assert(cond, msg) {
@@ -26,6 +29,12 @@ assert(slopeOk(0, Math.cos(25 * Math.PI / 180), Math.sin(25 * Math.PI / 180)), '
 assert(!slopeOk(0, Math.cos(40 * Math.PI / 180), Math.sin(40 * Math.PI / 180)), '40° incline rejected');
 assert(MAX_JUMP_LAND_H === 1.0, 'jump land height cap is 1 m');
 assert(MAX_HOLE_DROP === 2.5, 'hole drop cap is 2.5 m (rappel for deeper)');
+assert(PRONE_HEIGHT < CROUCH_HEIGHT, `prone envelope ${PRONE_HEIGHT.toFixed(2)} m < crouch ${CROUCH_HEIGHT.toFixed(2)} m`);
+assert(PRONE_HEIGHT < 0.5, 'prone height fits under ~0.5 m soffits');
+assert(Math.abs(CROUCH_HEIGHT - 0.88) < 0.02, 'crouch height unchanged (~0.88 m)');
+assert(PRONE_SPEED < 1.0, 'elbow-crawl is slower than upright crawl');
+assert(COMMIT_DURATION >= 2 && COMMIT_DURATION <= 3.5, 'commit duration is a short 2–3.5 s squeeze');
+assert(COMMIT_REACH >= 1.5 && COMMIT_REACH <= 3.5, 'commit reach is a short crawl assist');
 assert(!agentTriggersCompromise({ agent: true }), 'agent-tagged part must not trigger compromise');
 assert(!agentTriggersCompromise({ rescuer: true }), 'rescuer-tagged part must not trigger compromise');
 assert(!agentTriggersCompromise({ victim: true }), 'victim-tagged part must not trigger compromise');
@@ -183,6 +192,185 @@ assert(ACCESS_RADIUS > 0.3 && ACCESS_RADIUS < 1.5, `ACCESS_RADIUS=${ACCESS_RADIU
   assert(agent.accessedCount() === 1, 'ingress unlock + proximity scores VICTIM_ACCESSED');
   const accessedEv = agent.drainEvents().filter((e) => e.type === 'VICTIM_ACCESSED');
   assert(accessedEv.length === 1, 'emits exactly one VICTIM_ACCESSED after ingress');
+}
+
+// ---- clearanceToVictim pure helper ------------------------------------------
+{
+  const voidRef = {
+    x: 0, y: 0.5, z: 0, radius: 1.2, height: 0.7, h: 0.7, floorY: 0.1, confined: true,
+  };
+  const victim = {
+    id: 'c0', x: 1.0, y: 0.17, z: 0, voidRef, ingressUnlocked: true, lost: false,
+  };
+  const rescuer = { x: 0, y: 0.3, z: 0, feetY: 0.1 };
+  const voids = [voidRef];
+
+  assert(
+    clearanceToVictim({ rescuer, victim: { ...victim, ingressUnlocked: false }, voids }).reason === 'no_ingress',
+    'clearance rejects without ingress unlock',
+  );
+  assert(
+    clearanceToVictim({
+      rescuer, victim, voids, commitReach: 0.3,
+    }).reason === 'too_far',
+    'clearance rejects beyond commit reach',
+  );
+  // Debris only counts in gaps between voids — covered samples skip roof/floor AABBs.
+  assert(
+    clearanceToVictim({
+      rescuer, victim, voids: [],
+      debrisAabbs: [{ minX: 0.3, maxX: 0.7, minY: 0.15, maxY: 0.6, minZ: -0.4, maxZ: 0.4 }],
+    }).reason === 'blocked',
+    'clearance rejects blocking debris AABB when no void covers the path',
+  );
+  assert(
+    clearanceToVictim({
+      rescuer, victim, voids,
+      debrisAabbs: [{ minX: 0.3, maxX: 0.7, minY: 0.15, maxY: 0.6, minZ: -0.4, maxZ: 0.4 }],
+    }).ok === true,
+    'clearance ignores structure AABBs inside a tall-enough void',
+  );
+  assert(
+    clearanceToVictim({
+      rescuer, victim: { ...victim, voidRef: { ...voidRef, h: 0.3, height: 0.3 } },
+      voids: [{ ...voidRef, h: 0.3, height: 0.3 }],
+    }).reason === 'too_tight',
+    'clearance rejects void shorter than prone envelope',
+  );
+  const ok = clearanceToVictim({ rescuer, victim, voids, debrisAabbs: [] });
+  assert(ok.ok, 'clearance passes for unlocked short clear path');
+}
+
+// ---- prone near victim: horizontal proximity scores (the playtest bug) -------
+{
+  const pw = new RAPIER.World({ x: 0, y: -9.81, z: 0 });
+  const pg = pw.createRigidBody(RAPIER.RigidBodyDesc.fixed().setTranslation(0, -0.5, 0));
+  pw.createCollider(RAPIER.ColliderDesc.cuboid(20, 0.5, 20), pg);
+  pw.step();
+  const pSim = {
+    R: RAPIER, world: pw, opts: { rescuerLoad: 1.2 }, phase: 'frozen', frame: null,
+    rescue: { ladders: [] }, colliderToPart: new Map(), parts: [], voids: [],
+    confinedVoids() { return this.voids; },
+    _wakeNear() { return 0; },
+  };
+  const nearAgent = new RescuerAgent(pSim, { x: 0, y: spawnY, z: 0 });
+  nearAgent.snapToGround();
+  nearAgent.setProne(true);
+
+  const sideVoid = {
+    x: 1.1, y: 0.35, z: 0, radius: 0.9, height: 0.7, h: 0.7, floorY: 0, confined: true,
+  };
+  pSim.voids = [sideVoid];
+  // Victim ~1.1 m away horizontally; capsule centre Y differs from victim Y (old 3D
+  // hypot burned ACCESS_RADIUS on ΔY and never scored).
+  nearAgent.setVictims([{
+    id: 'vNear', x: 1.1, y: 0.07, z: 0, voidRef: sideVoid, ingressUnlocked: false,
+  }]);
+  nearAgent.accessed.clear();
+  nearAgent.drainEvents();
+
+  // Plant prone centre ~0.7 m from victim (within ACCESS_RADIUS + prone radius).
+  nearAgent._setPose({ x: 0.4, y: 0.0 + nearAgent.capRadius, z: 0 });
+
+  nearAgent._checkVictimAccess();
+  assert(nearAgent.accessedCount() === 0, 'prone near victim without ingress does not score');
+
+  nearAgent.unlockVictimIngress('vNear');
+  nearAgent._checkVictimAccess();
+  assert(nearAgent.accessedCount() === 1,
+    'prone + ingress + horizontal nearness scores VICTIM_ACCESSED');
+  const nearEv = nearAgent.drainEvents().filter((e) => e.type === 'VICTIM_ACCESSED');
+  assert(nearEv.length === 1, 'emits VICTIM_ACCESSED when crawling up to survivor');
+
+  // Standing regression: capsule centre sits ~0.84 m above the victim mid-body.
+  // Old 3D hypot used that ΔY and refused the score; horizontal band must still pass.
+  nearAgent.accessed.clear();
+  nearAgent.drainEvents();
+  if (nearAgent.prone) {
+    nearAgent._buildCapsuleCollider(CAPSULE_HALF, CAPSULE_RADIUS, { prone: false });
+    nearAgent.crouched = false;
+  }
+  nearAgent._setPose({ x: 0.4, y: 0.07 + CAPSULE_HALF + CAPSULE_RADIUS, z: 0 });
+  nearAgent.unlockVictimIngress('vNear');
+  nearAgent._checkVictimAccess();
+  assert(nearAgent.accessedCount() === 1,
+    'standing above same floor still scores on horizontal proximity');
+  nearAgent.dispose();
+}
+
+// ---- hole-column ingress unlock associates a side void -----------------------
+{
+  const voidRef = {
+    x: 1.5, y: 0.5, z: 0, radius: 0.7, height: 0.8, floorY: 0.1, confined: true,
+  };
+  const opening = { x: 0, y: 1.0, z: 0, radius: 0.3 };
+  agent.setVictims([{ id: 'vSide', x: 1.5, y: 0.17, z: 0, voidRef }]);
+  agent.accessed.clear();
+  agent.drainEvents();
+  agent._unlockVictimsNearOpening(opening);
+  assert(agent.victims[0].ingressUnlocked,
+    'cut hole unlocks a side void within ~2 m lateral reach');
+  agent._setPose({ x: 1.2, y: 0.17 + CAPSULE_HALF + CAPSULE_RADIUS, z: 0 });
+  agent._checkVictimAccess();
+  assert(agent.accessedCount() === 1, 'after side-void unlock, proximity scores');
+}
+
+// ---- prone capsule + assisted commit awards access --------------------------
+{
+  const pw = new RAPIER.World({ x: 0, y: -9.81, z: 0 });
+  const pg = pw.createRigidBody(RAPIER.RigidBodyDesc.fixed().setTranslation(0, -0.5, 0));
+  pw.createCollider(RAPIER.ColliderDesc.cuboid(20, 0.5, 20), pg);
+  pw.step();
+  const pSim = {
+    R: RAPIER, world: pw, opts: { rescuerLoad: 1.2 }, phase: 'frozen', frame: null,
+    rescue: { ladders: [] }, colliderToPart: new Map(), parts: [], voids: [],
+    confinedVoids() { return this.voids; },
+    _wakeNear() { return 0; },
+  };
+  const pAgent = new RescuerAgent(pSim, { x: 0, y: spawnY, z: 0 });
+  pAgent.snapToGround();
+  pAgent.drainEvents();
+  pAgent.setProne(true);
+  assert(pAgent.prone, 'setProne builds horizontal capsule');
+  assert(Math.abs(pAgent.capsuleHeight() - PRONE_HEIGHT) < 1e-6, 'prone capsuleHeight matches PRONE_HEIGHT');
+  assert(pAgent.mode === 'prone', 'mode is prone after setProne');
+  const proneEv = pAgent.drainEvents().filter((e) => e.type === 'RESCUER_PRONE' && e.prone);
+  assert(proneEv.length === 1, 'emits RESCUER_PRONE on enter');
+
+  const voidRef = {
+    x: 0.8, y: 0.4, z: 0, radius: 1.5, height: 0.8, h: 0.8, floorY: 0, confined: true,
+  };
+  pSim.voids = [voidRef];
+  pAgent.setVictims([{
+    id: 'vCommit', x: 1.2, y: 0.07, z: 0, voidRef, ingressUnlocked: false,
+  }]);
+  pAgent.accessed.clear();
+  pAgent.drainEvents();
+
+  // Without ingress, E must fail with no_ingress (no silent score).
+  pAgent._tryCommit();
+  const failNoIngress = pAgent.drainEvents().filter((e) => e.type === 'COMMIT_FAIL');
+  assert(failNoIngress.length === 1 && failNoIngress[0].reason === 'no_ingress',
+    'commit without ingress emits COMMIT_FAIL no_ingress');
+  assert(pAgent.accessedCount() === 0, 'failed commit does not score');
+
+  pAgent.unlockVictimIngress('vCommit');
+  pAgent._tryCommit();
+  const startEv = pAgent.drainEvents().filter((e) => e.type === 'COMMIT_START');
+  assert(startEv.length === 1, 'unlocked clear path starts COMMIT');
+  assert(pAgent.mode === 'commit', 'mode switches to commit');
+
+  let sawAccess = false;
+  for (let i = 0; i < Math.ceil(COMMIT_DURATION * 60) + 10; i++) {
+    pAgent.step(1 / 60, { camForward: { x: 1, z: 0 }, camRight: { x: 0, z: 1 } });
+    for (const e of pAgent.drainEvents()) {
+      if (e.type === 'VICTIM_ACCESSED') sawAccess = true;
+    }
+    if (sawAccess) break;
+  }
+  assert(sawAccess, 'successful commit awards VICTIM_ACCESSED');
+  assert(pAgent.accessedCount() === 1, 'accessed set has the committed victim');
+  pAgent.dispose();
 }
 
 // ---- frozen-world solid collision (no world.step between moves) -------------

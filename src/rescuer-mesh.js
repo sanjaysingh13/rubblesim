@@ -231,6 +231,66 @@ export function createVictimMesh() {
 }
 
 /**
+ * USAR stretcher trolley — a taken chess-piece bay for rescued survivors.
+ *
+ * Origin at ground under the bed centre. The canvas top sits at ~0.85 m so a prone
+ * victim mesh (origin mid-torso) can lie on it with a small Y offset.
+ * Built from primitives only — same art rule as the rescuer / tools.
+ */
+export function createStretcherTrolley() {
+  const root = new THREE.Group();
+  root.name = 'stretcher';
+  // Canvas bed — bright so a parked survivor is obvious from the pile camera.
+  const canvas = mat(0xd4c4a8, { roughness: 0.85 });
+  const rail = mat(0xb8c0c8, { metalness: 0.55, roughness: 0.35 });
+  const wheel = mat(0x222222, { roughness: 0.7 });
+  // High-vis corner posts so the triage bay reads at a distance.
+  const marker = mat(0xe85d04, { roughness: 0.5 });
+
+  // Four legs / uprights.
+  for (const [x, z] of [[-0.28, -0.55], [0.28, -0.55], [-0.28, 0.55], [0.28, 0.55]]) {
+    const leg = new THREE.Mesh(new THREE.CylinderGeometry(0.025, 0.025, 0.78, 8), rail);
+    leg.position.set(x, 0.39, z);
+    leg.castShadow = true;
+    root.add(leg);
+  }
+  // Long rails along the bed.
+  for (const x of [-0.28, 0.28]) {
+    const long = new THREE.Mesh(new THREE.BoxGeometry(0.04, 0.04, 1.2), rail);
+    long.position.set(x, 0.78, 0);
+    root.add(long);
+  }
+  // Cross bars.
+  for (const z of [-0.55, 0, 0.55]) {
+    const cross = new THREE.Mesh(new THREE.BoxGeometry(0.56, 0.03, 0.04), rail);
+    cross.position.set(0, 0.78, z);
+    root.add(cross);
+  }
+  // Canvas bed surface — survivors lie here after evacuation.
+  const bed = new THREE.Mesh(new THREE.BoxGeometry(0.52, 0.03, 1.15), canvas);
+  bed.position.set(0, 0.82, 0);
+  bed.receiveShadow = true;
+  root.add(bed);
+  // Small wheels (discs) at each corner — trolley silhouette.
+  for (const [x, z] of [[-0.28, -0.55], [0.28, -0.55], [-0.28, 0.55], [0.28, 0.55]]) {
+    const w = new THREE.Mesh(new THREE.CylinderGeometry(0.08, 0.08, 0.04, 10), wheel);
+    w.rotation.z = Math.PI / 2;
+    w.position.set(x, 0.08, z);
+    root.add(w);
+  }
+  // World Y of the bed top — callers park the victim mid-torso just above this.
+  root.userData.bedY = 0.85;
+  // Orange upright so the bay is findable when the camera is still in the pile.
+  const flag = new THREE.Mesh(new THREE.BoxGeometry(0.06, 1.1, 0.06), marker);
+  flag.position.set(0.35, 1.15, 0);
+  root.add(flag);
+  const flagTop = new THREE.Mesh(new THREE.BoxGeometry(0.35, 0.22, 0.04), marker);
+  flagTop.position.set(0.48, 1.55, 0);
+  root.add(flagTop);
+  return root;
+}
+
+/**
  * Clip a tool prop (from src/tool-mesh.js) into the right fist, replacing whatever was held.
  * Pass `null` to empty the hand. The caller owns disposal of the prop it hands over.
  */
@@ -282,14 +342,37 @@ function aimRightArmAt(group, translation, yaw, aim) {
  * `yaw` is heading in radians (0 = +Z). `walkPhase` drives a light limb swing when moving.
  * `aim` is an optional world point the held tool is being presented to; when given, the right arm
  * stops swinging and reaches for it and the left hand comes across to steady the machine.
+ *
+ * Modes `prone` / `elbow` / `commit` lay the figure flat (pitch ≈ 90°) so the mesh matches the
+ * horizontal capsule — this is NOT the upright squat used for crouch/crawl.
  */
 export function syncRescuerMesh(group, translation, yaw, walkPhase = 0, mode = 'idle', aim = null) {
   if (!group) return;
   group.position.set(translation.x, translation.y, translation.z);
-  group.rotation.set(0, yaw, 0);
 
   const limbs = group.userData.limbs;
   if (!limbs) return;
+
+  // Prone / elbow-crawl / assisted commit: horizontal figure, belly near the floor.
+  // Pitch the whole group so the torso lies along heading; do not squash with scale.y.
+  const proneLike = mode === 'prone' || mode === 'elbow' || mode === 'commit';
+  if (proneLike) {
+    group.scale.set(1, 1, 1);
+    // Pitch −90° around X after yaw so local +Y (up on the standing mesh) becomes −Z in
+    // local-before-yaw, then yaw swings that onto the world heading. Visually: lying on belly.
+    group.rotation.set(-Math.PI / 2, yaw, 0, 'YXZ');
+    const swing = mode === 'elbow' || mode === 'commit'
+      ? Math.sin(walkPhase) * 0.35
+      : 0;
+    // Elbows forward, legs trailing — reads as a low crawl into the void.
+    limbs.leftArm.rotation.set(-1.4 + swing, 0, 0.35);
+    limbs.rightArm.rotation.set(-1.4 - swing, 0, -0.35);
+    limbs.leftLeg.rotation.x = 0.25 - swing * 0.5;
+    limbs.rightLeg.rotation.x = 0.25 + swing * 0.5;
+    return;
+  }
+
+  group.rotation.set(0, yaw, 0);
 
   // Crouch / crawl: squat the figure (scale + fold) so it matches the shorter capsule.
   const crouched = mode === 'crouch' || mode === 'crawl';

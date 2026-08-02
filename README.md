@@ -427,7 +427,7 @@ Select with the tool ring or keys **0–7**; right-click to use. Left-drag still
 | --- | --- | --- |
 | Concrete cutter | 1 | Square hole in a slab; the plug drops, keeping its momentum |
 | Rebar cutter | 2 | Long pliers, short blades; snips rebar exposed at a fracture |
-| Cutting torch | 3 | Removes any structural joint in reach, including embedded ties |
+| Oxy-acetylene torch | 3 | Melts a steel **beam** joint; heat conducts ±2 m along the beam (0.5 m clearance) and can burn a survivor below |
 | Demolition hammer | 4 | Hold right-click: chips a widening, deepening hole; rebar stays for the snips |
 | Lifting bag | 5 | 4/10/20 t; **stalls** if the debris outweighs its rating, capped at 50 cm |
 | Shoring | 6 | T-shore / lace shore; carries measured load and offloads the column it braces |

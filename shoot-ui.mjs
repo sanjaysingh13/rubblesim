@@ -37,10 +37,10 @@ const afterKey = await page.evaluate(() => ({ tool: window.__app.activeTool(), r
 const pressedMatches = afterKey.ring.find((r) => r.on)?.tool === afterKey.tool;
 console.log(`pressed "4" -> activeTool=${afterKey.tool}, ring highlight in sync: ${pressedMatches}`);
 
-// --- raycast layer filtering: a torch must not be able to select concrete ----
+// --- tool switching (oxy-acetylene aims at concrete/beams; cutter too) --------
 const layerCheck = await page.evaluate(() => {
   const out = {};
-  window.__app.setEquipment('Cutting torch');
+  window.__app.setEquipment('Oxy-acetylene torch');
   out.torch = window.__app.params.equipment;
   window.__app.setEquipment('Concrete cutter');
   out.cutter = window.__app.params.equipment;

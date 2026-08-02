@@ -14,7 +14,7 @@ import { ensureAudio, playContact, playBodyBump, startGrind, stopGrind, startHam
 import { RescuerAgent } from './rescuer.js';
 import { CAPSULE_HALF, CAPSULE_RADIUS } from './rescuer-constants.js';
 import {
-  createRescuerMesh, createVictimMesh, createLadderMesh,
+  createRescuerMesh, createVictimMesh, createLadderMesh, createStretcherTrolley,
   syncRescuerMesh, disposeRescuerMesh, setHeldTool, heldTool,
 } from './rescuer-mesh.js';
 import {
@@ -23,9 +23,17 @@ import {
 import {
   reachCheck, reachMessage, cutPlaneOf, isBroadFace,
 } from './rescuer-reach.js';
+import { victimsBurnedByCut } from './torch-heat.js';
 
 const statusEl = document.getElementById('status');
-const setStatus = (t) => { statusEl.textContent = t; };
+/** Sticky success / fail toasts — locomotion spam must not overwrite them for a few seconds. */
+let statusStickyUntil = 0;
+const setStatus = (t, { stickyMs = 0 } = {}) => {
+  const now = performance.now();
+  if (stickyMs <= 0 && now < statusStickyUntil) return;
+  statusEl.textContent = t;
+  if (stickyMs > 0) statusStickyUntil = now + stickyMs;
+};
 
 const params = {
   ...DEFAULTS,
@@ -375,8 +383,8 @@ function showRebar(part) {
 }
 
 // Raycast layers (specs.md §4B): concrete on layer 0, reinforcement on layer 1, so the active
-// tool can restrict what it is physically able to grab. A torch set to layer 1 simply cannot
-// select a concrete face, which removes the whole class of "I aimed at rebar and cut the slab".
+// tool can restrict what it is physically able to grab. Rebar cutter → layer 1 only; oxy
+// torch → concrete (beam faces) so it can melt member joints, not snip cage rods.
 const LAYER_CONCRETE = 0, LAYER_REBAR = 1, LAYER_VOID = 2;
 
 function onAdd(part) {
@@ -512,6 +520,13 @@ function syncLadderMeshes() {
 let rescuer = null;
 let rescuerMesh = null;
 const victimMeshes = [];
+/** Stretchers parked outside the rubble — one bay, victims line up as they are reached. */
+const stretchers = [];
+const triageGroup = new THREE.Group();
+triageGroup.name = 'triageBay';
+scene.add(triageGroup);
+/** In-flight “lift off the board” moves: { mesh, from, to, t, duration }. */
+const evacuations = [];
 let victimsAccessed = 0;
 /** Compromises that score −1 (only after a rescue tool woke the pile). */
 let rescuerCompromised = 0;
@@ -532,8 +547,12 @@ function clearRescuer() {
   }
   // No carrier, no equipment: drop whatever was selected and lock the ring again.
   refreshEquipmentGate();
-  for (const m of victimMeshes) { agentsGroup.remove(m); disposeRescuerMesh(m); }
+  for (const m of victimMeshes) {
+    if (m.parent) m.parent.remove(m);
+    disposeRescuerMesh(m);
+  }
   victimMeshes.length = 0;
+  clearTriageBay();
   victimsAccessed = 0;
   rescuerCompromised = 0;
   params.rescuerMode = false;
@@ -545,6 +564,167 @@ function clearRescuer() {
   controls.minDistance = 1;
   controls.maxDistance = 200;
   controls.maxPolarAngle = Math.PI;
+}
+
+/**
+ * Tear down every stretcher and cancel in-flight evacuations (regenerate / despawn).
+ */
+function clearTriageBay() {
+  evacuations.length = 0;
+  for (const s of stretchers) {
+    triageGroup.remove(s);
+    disposeRescuerMesh(s);
+  }
+  stretchers.length = 0;
+  while (triageGroup.children.length) {
+    const c = triageGroup.children[0];
+    triageGroup.remove(c);
+    disposeRescuerMesh(c);
+  }
+}
+
+/**
+ * World pose for stretcher slot `index` — lined up clearly outside the rubble footprint
+ * on +X, like captured chess pieces along the side of the board.
+ */
+function stretcherSlotPose(index) {
+  const edge = (params.buildingSize || 6) / 2 + 6.0;
+  return {
+    x: edge,
+    y: 0,
+    z: -4.0 + index * 1.5,
+    yaw: Math.PI / 2, // bed long-axis along world X (radial from the pile)
+  };
+}
+
+/**
+ * Ensure stretcher `index` exists in the triage bay (lazy — only spawn as victims are reached).
+ */
+function ensureStretcher(index) {
+  while (stretchers.length <= index) {
+    const i = stretchers.length;
+    const trolley = createStretcherTrolley();
+    const pose = stretcherSlotPose(i);
+    trolley.position.set(pose.x, pose.y, pose.z);
+    trolley.rotation.y = pose.yaw;
+    triageGroup.add(trolley);
+    stretchers.push(trolley);
+  }
+  // Force a fresh world matrix — first-frame matrixWorld can be identity before the
+  // renderer ticks, which parked survivors at the origin (looked like a vanish).
+  stretchers[index].updateMatrixWorld(true);
+  return stretchers[index];
+}
+
+/**
+ * Resolve the mesh for a VICTIM_ACCESSED event. Prefer exact victimId — fuzzy position
+ * matching was painting a neighbour green while evacuating (or losing) the wrong figure.
+ */
+function findVictimMeshForEvent(e) {
+  if (e?.victimId != null) {
+    const byId = victimMeshes.find(
+      (m) => !m.userData.evacuated && m.userData.victimId === e.victimId,
+    );
+    if (byId) return byId;
+  }
+  // Fallback: nearest non-evacuated mesh to the event point (still prefer identity).
+  let best = null;
+  let bestD = 0.55;
+  for (const m of victimMeshes) {
+    if (m.userData.evacuated) continue;
+    const d = Math.hypot(m.position.x - e.x, m.position.z - e.z);
+    if (d < bestD) {
+      bestD = d;
+      best = m;
+    }
+  }
+  return best;
+}
+
+/**
+ * Chess-piece take: lift the survivor out of the void and park them on the next
+ * stretcher outside the rubble. Short scripted hop in world space, then reparent.
+ */
+function evacuateVictimToStretcher(vm, slotIndex) {
+  if (!vm || vm.userData.evacuated) return;
+  vm.userData.evacuated = true;
+  vm.visible = true;
+
+  // High-vis “rescued” paint — only this mesh (never a neighbour).
+  vm.traverse((o) => {
+    if (o.isMesh && o.material) {
+      o.material = o.material.clone();
+      o.material.color.set(0x33cc66);
+      o.material.needsUpdate = true;
+    }
+  });
+
+  const trolley = ensureStretcher(slotIndex);
+  const bedY = trolley.userData.bedY ?? 0.85;
+  // World destination = trolley origin + up along bed (yaw does not tilt Y).
+  const dest = new THREE.Vector3(
+    trolley.position.x,
+    bedY + 0.1,
+    trolley.position.z,
+  );
+  // Capture world start in case the mesh was already nested somewhere unusual.
+  const from = new THREE.Vector3();
+  vm.getWorldPosition(from);
+
+  // Keep the hop under agentsGroup in world space (avoids parent-matrix surprises mid-flight).
+  if (vm.parent !== agentsGroup) {
+    if (vm.parent) vm.parent.remove(vm);
+    agentsGroup.add(vm);
+    vm.position.copy(from);
+  }
+
+  evacuations.push({
+    mesh: vm,
+    from: from.clone(),
+    to: dest.clone(),
+    t: 0,
+    duration: 0.55,
+    trolley,
+    bedLocalY: bedY + 0.1,
+  });
+}
+
+/**
+ * Advance in-flight evacuations — ease out of the pile, brief apex, settle onto the bed.
+ */
+function stepEvacuations(dt) {
+  for (let i = evacuations.length - 1; i >= 0; i--) {
+    const ev = evacuations[i];
+    if (!ev.mesh) {
+      evacuations.splice(i, 1);
+      continue;
+    }
+    ev.t += dt;
+    const u = Math.min(1, ev.t / ev.duration);
+    const s = u * u * (3 - 2 * u);
+    const lift = Math.sin(Math.PI * u) * 1.6;
+    ev.mesh.position.set(
+      ev.from.x + (ev.to.x - ev.from.x) * s,
+      ev.from.y + (ev.to.y - ev.from.y) * s + lift,
+      ev.from.z + (ev.to.z - ev.from.z) * s,
+    );
+    ev.mesh.visible = true;
+    if (u >= 1) {
+      const trolley = ev.trolley;
+      if (trolley) {
+        // attach() preserves world transform then we snap to bed-local — reliable reparent.
+        trolley.attach(ev.mesh);
+        ev.mesh.position.set(0, ev.bedLocalY, 0);
+        // Lie along the bed (trolley local +Z is the long axis).
+        ev.mesh.rotation.set(0, 0, 0);
+        ev.mesh.visible = true;
+        trolley.updateMatrixWorld(true);
+      } else {
+        ev.mesh.position.copy(ev.to);
+      }
+      evacuations.splice(i, 1);
+    }
+  }
 }
 
 /**
@@ -630,7 +810,8 @@ function spawnRescuer() {
   agentsGroup.add(rescuerMesh);
   if (victimMeshes.length) {
     rescuer.setVictims(victimMeshes.map((m, i) => ({
-      id: `v${i}`, x: m.position.x, y: m.position.y, z: m.position.z, voidRef: m.userData.voidRef,
+      id: m.userData.victimId || `v${i}`,
+      x: m.position.x, y: m.position.y, z: m.position.z, voidRef: m.userData.voidRef,
     })));
   } else if (voidsList.length) {
     spawnVictimMeshes();
@@ -650,9 +831,13 @@ function attachVictimsFromMarkers() {
 /** Eye height above the soles of the boots — roughly a standing adult. */
 const EYE_HEIGHT = 1.65;
 const EYE_HEIGHT_CROUCH = 0.72;
+const EYE_HEIGHT_PRONE = 0.28;
 
 function rescuerEyeHeight() {
-  return (rescuer && rescuer.crouched) ? EYE_HEIGHT_CROUCH : EYE_HEIGHT;
+  if (!rescuer) return EYE_HEIGHT;
+  if (rescuer.prone || rescuer.mode === 'commit') return EYE_HEIGHT_PRONE;
+  if (rescuer.crouched) return EYE_HEIGHT_CROUCH;
+  return EYE_HEIGHT;
 }
 
 /**
@@ -711,8 +896,9 @@ function stepRescuer(dt) {
     jump: jumpEdge,
     interact: interactEdge,
     // Shift or Z — hold to crouch, release to stand. (Ctrl steals Ctrl+W/A/S/D in the browser.)
-    // C remains Collapse.
+    // C remains Collapse. X — hold for prone / elbow-crawl into low voids.
     crouch: keysDown.has('shift') || keysDown.has('z'),
+    prone: keysDown.has('x'),
     camForward: basis.forward,
     camRight: basis.right,
     loadkN: params.rescuerLoad,
@@ -728,13 +914,45 @@ function stepRescuer(dt) {
     if (e.type === 'VICTIM_ACCESSED') {
       victimsAccessed++;
       const score = victimsAccessed - rescuerCompromised;
-      setStatus(`✓ victim reached (+1) — score ${score} (${victimsAccessed} reached, ${rescuerCompromised} ops-compromised)`);
+      setStatus(
+        `✓ victim reached (+1) — evacuating to triage bay (+X) · score ${score}`,
+        { stickyMs: 6000 },
+      );
+      // Chess-piece take: exact victimId only (fuzzy pos match was greening a neighbour).
+      const vm = findVictimMeshForEvent(e);
+      if (vm) {
+        const slot = victimMeshes.filter((m) => m.userData.evacuated).length;
+        evacuateVictimToStretcher(vm, slot);
+      } else {
+        setStatus(
+          `✓ victim reached (+1) — score ${score} (mesh missing for ${e.victimId})`,
+          { stickyMs: 6000 },
+        );
+      }
     } else if (e.type === 'INGRESS_UNLOCKED') {
-      setStatus('entered cut opening — search the pocket for the survivor');
+      setStatus('entered cut opening — search the pocket for the survivor', { stickyMs: 2500 });
     } else if (e.type === 'HOLE_SLIDE') {
-      setStatus('dropping through clear opening — crouch (Shift/Z) if the void is low');
+      setStatus('dropping through clear opening — crouch (Shift/Z) or prone (X) if the void is low');
     } else if (e.type === 'RESCUER_CROUCH_BLOCKED') {
       setStatus('cannot stand — overhead too low (stay crouched or crawl clear)');
+    } else if (e.type === 'RESCUER_PRONE') {
+      if (e.prone) setStatus('prone — elbow-crawl (WASD) into the pocket · E commits if clear');
+      else if (e.pose === 'crouch') setStatus('rose to crouch — overhead still too low to stand');
+      else setStatus('stood up from prone');
+    } else if (e.type === 'RESCUER_PRONE_BLOCKED') {
+      setStatus('cannot rise — void too tight (stay prone or crawl clear)');
+    } else if (e.type === 'COMMIT_READY') {
+      setStatus('pocket clear — press E to commit to survivor');
+    } else if (e.type === 'COMMIT_START') {
+      setStatus('committing through the void…', { stickyMs: 2000 });
+    } else if (e.type === 'COMMIT_FAIL') {
+      const why = e.reason === 'blocked' ? 'blocked by debris'
+        : e.reason === 'too_tight' ? 'void too tight'
+        : e.reason === 'no_ingress' ? 'enter a cut opening first'
+        : e.reason === 'no_path' ? 'no connected floor path'
+        : e.reason === 'lost' ? 'survivor compromised'
+        : 'too far';
+      setStatus(`${why} — cut another ingress or shore`, { stickyMs: 3500 });
     } else if (e.type === 'RESCUER_BUMP') {
       ensureAudio();
       playBodyBump();
@@ -893,8 +1111,14 @@ function applyFreeze() {
 const VICTIM_FLOOR_OFFSET = 0.07;
 
 function spawnVictimMeshes() {
-  for (const m of victimMeshes) { agentsGroup.remove(m); disposeRescuerMesh(m); }
+  // Detach + dispose survivors first (some may be parented to stretchers after evacuation).
+  evacuations.length = 0;
+  for (const m of victimMeshes) {
+    if (m.parent) m.parent.remove(m);
+    disposeRescuerMesh(m);
+  }
   victimMeshes.length = 0;
+  clearTriageBay();
   // Only confined pockets get survivors — open/walkable voids stay for intrusion only.
   const confined = voidsList.filter((v) => v.confined);
   const maxV = Math.min(confined.length, 8);
@@ -904,12 +1128,15 @@ function spawnVictimMeshes() {
     const floorY = (v.floorY != null ? v.floorY : v.y - v.height / 2) + VICTIM_FLOOR_OFFSET;
     mesh.position.set(v.x, floorY, v.z);
     mesh.userData.voidRef = v;
+    mesh.userData.victimId = `v${i}`;
+    mesh.userData.evacuated = false;
     agentsGroup.add(mesh);
     victimMeshes.push(mesh);
   }
   if (rescuer) {
     rescuer.setVictims(victimMeshes.map((m, i) => ({
-      id: `v${i}`, x: m.position.x, y: m.position.y, z: m.position.z, voidRef: m.userData.voidRef,
+      id: m.userData.victimId || `v${i}`,
+      x: m.position.x, y: m.position.y, z: m.position.z, voidRef: m.userData.voidRef,
     })));
   }
 }
@@ -945,6 +1172,7 @@ function checkVoidIntrusion() {
         // Paint matching victim red if present.
         for (let i = 0; i < victimMeshes.length; i++) {
           const vm = victimMeshes[i];
+          if (vm.userData.evacuated) continue;
           if (vm.userData.voidRef === v ||
               Math.hypot(vm.position.x - v.x, vm.position.z - v.z) < 0.35) {
             vm.traverse((o) => {
@@ -1186,10 +1414,9 @@ let hammerTargetPart = null; // slab locked for the duration of one RMB hold
 
 /**
  * Point the raycaster at only what the current tool can legitimately grab.
- * Cutters and the hammer see concrete (layer 0); bag/shore need concrete surfaces to find an
- * interface. The REBAR CUTTER sees only reinforcement (layer 1) — it aims at the visible red
- * rods (hole cage, frayed edges, skinned lattice), not at concrete faces. The torch keeps both
- * layers so it can still find embedded joints near a rebar hit. Void volumes are never targets.
+ * Cutters, hammer, and oxy-acetylene see concrete (layer 0) — the torch aims at beam faces to
+ * melt member joints. Bag/shore need concrete surfaces to find an interface. The REBAR CUTTER
+ * sees only reinforcement (layer 1). Void volumes are never targets.
  */
 function setRaycastLayers() {
   raycaster.layers.enableAll();
@@ -1255,9 +1482,11 @@ function updateToolAim(clientX, clientY) {
         }
       }
     } else if (kind === 'torch') {
+      // Oxy-acetylene melts steel BEAM joints only — not slab ties or column welds.
       engaged = !!sim.joints.find((rec) => !rec.broken && !rec.a.dead && !rec.b.dead &&
-        (rec.type === 'tie' || rec.type === 'member') && jointNear(rec, hitPoint, tool.reach));
-      if (!engaged) blockReason = 'no structural joint in torch range';
+        rec.type === 'member' && rec.member && rec.member.kind === 'beam' &&
+        jointNear(rec, hitPoint, tool.reach));
+      if (!engaged) blockReason = 'aim at a beam joint to melt (oxy-acetylene cuts steel beams only)';
     } else if (kind === 'bag') {
       engaged = !!hitPart;
       if (!engaged) blockReason = 'no interface here — aim just under a slab edge';
@@ -1508,7 +1737,7 @@ function applyEquipment() {
     return;
   }
 
-  // torch / pliers: one-shot point tools (hammer is hold-to-chip above)
+  // oxy torch / pliers: one-shot point tools (hammer is hold-to-chip above)
   if (tool.kind === 'rebar') {
     tool.reach = params.cutReach;
     // Square up to the seam before the jaws close — same small correction the cutter does.
@@ -1518,14 +1747,22 @@ function applyEquipment() {
   if (!res.severed) {
     setStatus(tool.kind === 'rebar'
       ? 'no exposed rod under the jaws — aim at a visible red bar'
-      : `${tool.label}: nothing to act on there`);
+      : tool.kind === 'torch'
+        ? 'no beam joint in range — aim at a steel beam to melt'
+        : `${tool.label}: nothing to act on there`);
     return;
   }
   grind(tool.kind === 'rebar' ? 450 : 300);
   if (tool.kind === 'rebar') cutUntil = performance.now() + 450;   // viewmodel kick while snipping
   if (res.points[0]) { lastCutWorld.set(res.points[0].x, res.points[0].y, res.points[0].z); addCutMarks(res.points); }
   resume();
-  if (tool.kind === 'rebar') {
+  if (tool.kind === 'torch') {
+    const burned = applyTorchHeatCompromise(res, tool);
+    const score = victimsAccessed - rescuerCompromised;
+    setStatus(burned
+      ? `🔥 oxy-acetylene — beam melted · ${burned} survivor burn(s) along heat path (−${burned}) · score ${score}`
+      : `🔥 oxy-acetylene — beam melted, ${res.woken ?? 0} pieces re-settling`);
+  } else if (tool.kind === 'rebar') {
     setStatus(res.dropped
       ? `✂ rebar snipped — ${res.dropped} freed bar${res.dropped > 1 ? 's' : ''} falling`
       : (res.brokeTie
@@ -1534,6 +1771,57 @@ function applyEquipment() {
   } else {
     setStatus(`✂ ${tool.label} — joint severed, ${res.woken ?? 0} pieces re-settling`);
   }
+}
+
+/**
+ * After an oxy-acetylene cut: score ops-compromise for any survivor within ±heatAlong of the
+ * cut along the beam axis and within heatClearance of the steel (torch-heat.js). Independent
+ * of debris AABB intrusion.
+ */
+function applyTorchHeatCompromise(res, tool) {
+  if (!res?.member || !res.cutPoint) return 0;
+  const opts = {
+    along: tool.heatAlong ?? 2.0,
+    clearance: tool.heatClearance ?? 0.5,
+  };
+  // Use prone victim positions (void floor), not void centres mid-pocket.
+  const candidates = [];
+  for (const vm of victimMeshes) {
+    const v = vm.userData.voidRef;
+    if (!v || v.compromised) continue;
+    candidates.push({
+      x: vm.position.x, y: vm.position.y, z: vm.position.z,
+      compromised: false,
+      voidRef: v,
+      mesh: vm,
+    });
+  }
+  const burned = victimsBurnedByCut(res.cutPoint, res.member, candidates, opts);
+  let n = 0;
+  for (const c of burned) {
+    const v = c.voidRef;
+    if (!v || v.compromised) continue;
+    v.compromised = true;
+    compromised++;
+    rescuerCompromised++;
+    n++;
+    voidEvents.push({
+      type: 'SURVIVOR_COMPROMISED',
+      x: v.x, y: v.y, z: v.z,
+      by: 'torch-heat',
+      scored: true,
+    });
+    if (rescuer) rescuer.markVoidCompromised(v);
+    if (c.mesh) {
+      c.mesh.traverse((o) => {
+        if (o.isMesh) {
+          o.material = o.material.clone();
+          o.material.color.set(0xff3344);
+        }
+      });
+    }
+  }
+  return n;
 }
 
 /**
@@ -1851,7 +2139,7 @@ addEventListener('keydown', (e) => {
   if (!e.repeat && (k === ' ' || k === 'spacebar')) { jumpEdge = true; e.preventDefault(); }
   if (!e.repeat && k === 'e' && params.rescuerMode) { interactEdge = true; e.preventDefault(); return; }
   // Keep Shift/Z from scrolling / finding-in-page while rescuer is in control.
-  if (params.rescuerMode && (k === 'shift' || e.key === 'Shift' || k === 'z')) e.preventDefault();
+  if (params.rescuerMode && (k === 'shift' || e.key === 'Shift' || k === 'z' || k === 'x')) e.preventDefault();
 
   if (k === 'p') rebuild();
   else if (k === 'c') doCollapse();
@@ -1905,8 +2193,8 @@ addEventListener('keyup', (e) => {
   if (!e.shiftKey) keysDown.delete('shift');
 });
 // Focus loss often drops keyup for modifiers — never leave crouch latched.
-addEventListener('blur', () => { keysDown.delete('shift'); keysDown.delete('z'); });
-window.addEventListener('blur', () => { keysDown.delete('shift'); keysDown.delete('z'); });
+addEventListener('blur', () => { keysDown.delete('shift'); keysDown.delete('z'); keysDown.delete('x'); });
+window.addEventListener('blur', () => { keysDown.delete('shift'); keysDown.delete('z'); keysDown.delete('x'); });
 
 // ---------------------------------------------------------------------------
 // Main loop
@@ -1969,6 +2257,8 @@ function tick() {
     }
     syncLadderMeshes();
   }
+  // Stretcher evacuations keep running even if rescuer control is toggled off mid-hop.
+  stepEvacuations(dt);
   if (params.rescuerMode && rescuer) updateRescuerCamera(dt);
   else if (!params.rescuerMode) controls.enabled = true;
 

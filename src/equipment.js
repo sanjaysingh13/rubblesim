@@ -5,8 +5,9 @@
 // declares what it is allowed to hit:
 //
 //   picks: 'concrete' — only structural concrete geometry (raycast layer 0)
-//          'rebar'    — only exposed reinforcement (raycast layer 1); a torch cannot cut concrete
+//          'rebar'    — only exposed reinforcement (raycast layer 1); pliers only, not the torch
 //          'gap'      — an interface / floor position rather than a surface (bags, shoring)
+//          Oxy-acetylene picks 'concrete' so it can aim at beam faces and melt member joints.
 //
 // `kind` tells the renderer which cursor / prop to draw.
 //
@@ -68,10 +69,15 @@ export const EQUIPMENT = [
     apply(sim, { point }) { return sim.cutRebar(point, this.reach); },
   },
   {
-    id: 'TORCH', label: 'Cutting torch', short: 'Torch', kind: 'torch', picks: 'rebar', reach: 0.8, key: '3',
-    hint: 'Burns through any structural joint in reach — including still-embedded ties.',
+    // Oxy-acetylene: melts steel beam joints (not slab ties / columns). Heat conducts ±heatAlong
+    // metres along the beam; victims within heatClearance of that heated segment burn (ops −1).
+    id: 'TORCH', label: 'Oxy-acetylene torch', short: 'Oxy', kind: 'torch', picks: 'concrete',
+    reach: 0.8, key: '3',
+    heatAlong: 2.0,       // m either side of the cut along the beam axis
+    heatClearance: 0.5,   // m clearance to the heated steel (not a free-air sphere)
+    hint: 'Melt through a steel beam joint. Heat travels ±2 m along the beam — check for victims below.',
     toolLength: 0.40, needsReach: false, available: true,
-    apply(sim, { point }) { return sim.cutJointNear(point, this.reach); },
+    apply(sim, { point }) { return sim.cutBeamNear(point, this.reach); },
   },
   {
     // Electric demolition hammer (breaker): hold RMB to chip a widening, deepening circular

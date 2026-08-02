@@ -798,39 +798,146 @@ hammered opening — are removed from the parent mesh and spawned as dynamic deb
 (`_dropLooseRebar` / `_spawnRebarDebris`). Snip gap breaks lattice adjacency so stubs across
 a cut do not stay welded. `verify-rebar-fall.mjs` covers this.
 
-**Victim placement + USAR score (2026-08-02).**
+**USAR game loop — victims, score, confine, hole entry, crouch (2026-08-02).**
 
-- **No floating victims:** `detectVoids` stores `floorY`; prone figures sit on the pocket floor
-  (`floorY + 0.07`), not at the void midpoint.
-- **No void wireframes:** cyan sphere markers / `V` toggle removed. Voids remain as invisible
-  AABB targets for spawn + intrusion. HUD shows **USAR score** instead of void counts.
-- **+1 reach:** rescuer must pass through a registered cutter hole or through hammer breach
-  (`sim.openings` / `openingIngressAt`), unlocking nearby victims, then get within
-  `ACCESS_RADIUS`. Proximity alone no longer scores.
-- **−1 ops-compromise:** `sim.compromiseAttribution` is set when a rescue tool wakes debris.
-  Later `SURVIVOR_COMPROMISED` events increment `rescuerCompromised` (and the score); pre-tool
+### Placement & search
+- Victims sit on void **`floorY`** (+0.07 m), not mid-air at the pocket centre.
+- Cyan void wireframes / **V** toggle removed. Voids stay as invisible AABBs for spawn +
+  compromise intrusion only — the rescuer searches by sight and cutting.
+- Survivors spawn **only in confined** pockets (`_isVoidConfined`): ≥6/8 lateral solid hits
+  within `voidConfineRadius` (1 m) at torso height, and not an exposed rooftop deck
+  (`voidRooftopMaxClear`). Open/walkable voids remain for intrusion tracking but get no
+  victim. Freeze status: `N voids · M confined` (or “no trapped survivors — regenerate”).
+- Tunables under Timing / voids: confine radius, min side hits, rooftop reject.
+
+### Scoring
+- **Score** = victims reached − ops-compromised (loads panel).
+- **+1 reach:** must pass through a **passable** opening (`openingPassable` /
+  `openingIngressAt`) then get within `ACCESS_RADIUS`. Cutter holes are passable immediately;
+  hammer through-breaches need spanning rebar cleared. Proximity alone does not score.
+- **−1 ops-compromise:** today any void intrusion after `compromiseAttribution` (a rescue tool
+  woke debris) scores −1. That is too coarse — see **Ops-compromise realism** below. Pre-tool
   crush still paints the victim lost but does not change score.
-- **Hole drop ≤ 2.5 m:** `_resolveJumpLanding` rejects drops deeper than `MAX_HOLE_DROP`
-  (`too_deep`).
+
+### Ops-compromise realism (living — expand with each tool)
+
+**Problem today.** Once any rescue tool sets `compromiseAttribution`, *any* debris AABB that
+later overlaps a void scores ops-compromise. Distant resettling, harmless chip fallout, and a
+slab crushing a survivor are treated the same. Ops-compromise must measure **impact on the
+victim** (what hit them, how hard, from which tool), not “the pile moved somewhere.”
+
+**Principle.** A rescuer action compromises a survivor only when that action (or debris it
+directly caused) delivers a **hazard above threshold** into that survivor’s pocket. Cascade
+wake elsewhere does not count unless a body that the action freed or dropped actually strikes
+the void with enough mass / energy / heat. Pre-collapse crush remains unscored theatre.
+
+**Impact sketch (to implement later — keep refining).** For each debris contact with a void
+that holds a victim, estimate something like:
+
+- `m` — contacting body mass (kg), from part volume × material density.
+- `h` / `v` — drop height or impact speed at contact (from release point or body velocity).
+- `E ≈ m · g · h` or `½ m v²` — kinetic / potential energy delivered into the pocket.
+- `A` — overlap footprint vs the victim / void floor (small chips → tiny `A`).
+- **Compromise if** `E` (or contact pressure `E/A`) exceeds a per-hazard threshold, **or** the
+  contacting body is a **structural plug / slab fragment** whose projected footprint covers
+  the victim (crush by cover), regardless of a modest energy number.
+
+Chip-scale concrete (`chip` / hammer spall debris) is **forever safe** — never ops-compromise
+from chip fallout alone. Full tile plugs, cut squares, and collapsing slab pieces sit well
+above any future energy threshold.
+
+#### Equipment hazard catalog
+
+Living table — add a row whenever a tool ships or changes behaviour. “Ops −1” means score
+penalty after freeze; paint-only crush still applies for pre-tool collapse.
+
+| Tool | Hazard to victim | Compromises when… | Does **not** compromise when… |
+|------|------------------|-------------------|-------------------------------|
+| **Concrete cutter** | Cut square / plug drops into the void | Plug (or a slab piece freed by the cut) falls onto / into a void that holds a victim — rescuer should have assessed who was below the cut | Cut over an empty void; plug lands beside the pocket without covering the victim; distant pile wake with no plug into this void |
+| **Demolition hammer** | Overhead chipping — small concrete chips only | *(never from chip fallout)* | Chips / dust forever safe, including working directly overhead a victim. Through-breach + later lattice clear is a separate path (rebar / cutter rules) |
+| **Rebar cutter** | Snipped cage / loose rods drop (`_dropLooseRebar`) | A dropped rod island or freed concrete piece strikes the victim pocket above energy / cover threshold | Light rod stubs that miss the pocket; snip that only opens ingress without dumping mass onto the survivor |
+| **Oxy-acetylene torch** | Melts steel beam joints; heat conducts along the member | (1) Victim within **±2 m** of the cut along the beam axis **and** within **0.5 m** clearance of the heated steel (`torch-heat.js`) → burn ops-compromise. (2) Later: freed beam segment drops onto a void (mass/crush path, still coarse today) | Cut on a beam with no victim near the heated segment; aiming at slabs / columns / ties (tool refuses — beams only). No free-air heat sphere around the cut |
+| **Lift bag / shore** | Load shift / punch-through / shore kick-out | Inflate or shore placement causes a supported piece to settle or fail onto a victim | Stable lift that creates space without dumping mass into the pocket |
+| **Ladder** | — | — | Placement / climbing alone never compromises (body excluded from intrusion already) |
+
+#### Planned tools (embellish here first, then code)
+
+| Tool (planned) | Hazard | Compromise sketch |
+|----------------|--------|-------------------|
+| **Exothermic / plasma cutter** (hotter than oxy-acetylene; exposed iron / heavy sections) | Larger heat path + slag; beam/section drop | Same along-member heat idea with a wider radius / higher clearance; mass drop treated as structural crush |
+| *(add next equipment here)* | | |
+
+#### Rules of thumb (USAR flavour)
+
+1. **Slab / plug on victim** as a result of rescuer action → always ops-compromise.
+2. **Cutter square dropped on victim** → ops-compromise (failed “who is below?” assessment).
+3. **Hammer chips overhead** → forever safe; never ops-compromise from chip fallout.
+4. **Oxy-acetylene heat** → along-beam only (±2 m × 0.5 m clearance), independent of debris AABB intrusion. Not an air sphere around the tip.
+5. **Attribution** should bind to the **causal tool + contacting body**, not a global
+   `compromiseAttribution` latch for the whole pile.
+
+**Implementation status:** oxy-acetylene **heat burn scoring** ships (`cutBeamNear` + `burnsAlongBeam`).
+Debris mass/energy intrusion is still the global latch + any AABB overlap — replace that
+incrementally next (cutter plugs first).
+
+### Hole entry & locomotion
+- Stepping onto a passable opening commits **`HOLE_SLIDE`**: snap/autostep off, teleport
+  below the slab band, fall (still ≤ `MAX_HOLE_DROP` 2.5 m). Fixes the earlier rim
+  up/down oscillation (KCC snap fighting a soft nudge).
+- **Crouch / crawl:** hold **Shift** or **Z** (not Ctrl — Ctrl+WASD hits browser shortcuts).
+  Capsule ~0.88 m (`CROUCH_HALF` / `CROUCH_RADIUS`), crawl ~0.95 m/s. Release to stand;
+  overhead blocked → `RESCUER_CROUCH_BLOCKED`. Stand probe excludes the rescuer’s own body
+  (self-hit had made crouch feel permanent).
+- Human scale is intentional (~1.68 m vs 2.6 m stories); figures look large vs 0.6 m cutter
+  holes because those openings are tight USAR ingress, not a scale bug.
+
+### Confined access after hole entry (shipped 2026-08-02)
+
+**Problem (playtest).** Rescuer cuts a 0.6 m square, `HOLE_SLIDE`s in, sees a victim in a
+side void, but could not crawl there. Crouch at the rim left feet sticking out — expected:
+the opening is shorter than a body length, and the old “crawl” was an **upright squat
+capsule** (~0.88 m), not a prone figure.
+
+**Shipped hybrid.**
+1. Player agency for approach — cut, clear rebar, drop / crouch / prone in. No auto
+   `VICTIM_ACCESSED` on rim clear alone.
+2. **Prone / elbow-crawl (X):** horizontal capsule (`PRONE_RADIUS` / `PRONE_HALF`, envelope
+   ~0.44 m), ~0.45 m/s. Release X auto-picks stand or crouch by headroom
+   (`RESCUER_PRONE_BLOCKED` once per failed rise — not every frame, or the toast spam
+   overwrote ✓ victim reached). Shift/Z crouch unchanged.
+3. **Assisted commit:** `clearanceToVictim` / `clearanceForAgent` in `confined-access.js`
+   (same void / floor path, height ≥ prone envelope, ≤ `COMMIT_REACH`, no blocking debris
+   AABB). While prone: `COMMIT_READY` hint when clear; **E** starts ~2.5 s squeeze →
+   `VICTIM_ACCESSED`. Fail → explicit `COMMIT_FAIL` reason (no silent teleport).
+4. **Scoring touch:** horizontal distance to the **prone body segment** (not raw 3D
+   centre hypot — ΔY was eating `ACCESS_RADIUS`). After any cut ingress (`hasMadeIngress`),
+   occupying a side void unlocks that pocket’s survivor (hole association alone missed
+   voids >~2.5 m laterally). Sticky ✓ toast 6 s.
+5. **Triage bay (chess-piece take):** on `VICTIM_ACCESSED`, the matched mesh (by
+   `victimId` only — fuzzy pos match greened neighbours) hops in world space onto a
+   stretcher trolley on **+X** outside the footprint (`createStretcherTrolley`, orange
+   flag). Bay clears on regenerate. Early bugs: stale `matrixWorld` parked survivors at
+   the origin (looked like a vanish); fixed with world hop + `attach()`.
+6. Clearance API ready for the telescopic probe camera TODO.
+
+**Still separate TODOs:** rappelling (> 2.5 m drops); telescopic camera (shares clearance API).
+
+### Verify / HUD / playtest harness
+- `verify-rescuer.mjs`: floorY, confine heuristics, ingress gate, hole-drop, prone envelope
+  vs crouch, `clearanceToVictim` pass/fail, commit → `VICTIM_ACCESSED`, prone nearness score.
+- `verify-confined-access.mjs`: prone proximity +1, side-void unlock, occupy-after-ingress,
+  roof AABB false-block regression, commit despite structure parts.
+- `verify-torch.mjs`: along-beam heat (±2 m × 0.5 m) + `cutBeamNear` beams-only.
+- `npm run verify` includes `verify-confined-access.mjs`.
+- `play-score.mjs`: Playwright drive against vite (`?test=1`) — regen until confined
+  survivors exist, prone + ingress → `victims reached ≥ 1`, screenshots to `~/play_score*.png`.
+  (Skips full cut-and-drop; proves score → toast → evacuate path.)
+- HUD: Shift/Z crouch, X prone/elbow-crawl, E commit when pocket clear; triage bay note.
 
 **TODO — rappelling** for voids deeper than 2.5 m.
 
 **TODO — telescopic camera** the rescuer can drop into a void to probe when the pocket is not
-fully visible from outside.
+fully visible from outside. Reuse the confined-access clearance check when that ships.
 
-**Confined victims only (2026-08-02).** Open / walkable voids still detect for compromise AABBs,
-but survivors spawn only in **confined** pockets: ≥6/8 lateral solid hits within 1 m at torso
-height, and not an exposed rooftop deck (`voidRooftopMaxClear`). Status reports
-`N voids · M confined` and refuses to place walk-up victims. Ingress scoring unchanged.
-
-**Hole slide + crouch (2026-08-02).** Stepping onto a **passable** opening (concrete-cutter hole,
-or hammer through-breach with spanning rebar cleared) slides the rescuer down (`HOLE_SLIDE`,
-still capped at 2.5 m). Hold **Shift** or **Z** to crouch: capsule shrinks to ~0.88 m
-(`CROUCH_HALF` / `CROUCH_RADIUS`) so he can crawl into low voids; crawl speed ~0.95 m/s.
-Standing blocked under low overhead emits `RESCUER_CROUCH_BLOCKED`. (Ctrl was dropped — it
-steals Ctrl+W/A/S/D from the browser.) Human scale is correct
-(~1.68 m vs 2.6 m stories); they look large vs 0.6 m cutter holes by design.
-
-**Next — expand reach gating to the remaining tools one at a time** (torch, bag, shore;
-ladder already mounts via `E`). Flip `needsReach: true` and harden each tool's eligibility.
-
+**Next:** expand reach gating to remaining tools (oxy torch, bag, shore; ladder already
+mounts via `E`).

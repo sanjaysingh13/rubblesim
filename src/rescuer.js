@@ -10,9 +10,11 @@
 //
 // LOCOMOTION MODES
 // ----------------
-//   idle | walk | jump | mantle | ladder | fallen
+//   idle | walk | jump | mantle | ladder | fallen | crouch | crawl | prone | elbow | commit
 // Mantle = pull-up onto a ledge ~2.1–2.4 m above the feet (USAR "pull yourself up ~7–8 ft").
 // Ladder = climb a placed RescueOps ladder along its axis.
+// Crouch/crawl = upright squat capsule (~0.88 m). Prone/elbow = horizontal capsule (~0.44 m).
+// Commit = short player-independent squeeze to a cleared victim (clearance-gated).
 //
 // LIVE LOAD
 // ---------
@@ -20,13 +22,24 @@
 // (and a multiple during mantle). Post-collapse, waking debris underfoot is what actually
 // stresses the rubble contact graph.
 
-import { CAPSULE_RADIUS, CAPSULE_HALF, CROUCH_RADIUS, CROUCH_HALF, RESCUER_MASS_T } from './rescuer-constants.js';
+import {
+  CAPSULE_RADIUS, CAPSULE_HALF, CROUCH_RADIUS, CROUCH_HALF, CROUCH_HEIGHT,
+  PRONE_RADIUS, PRONE_HALF, PRONE_HEIGHT, RESCUER_MASS_T,
+} from './rescuer-constants.js';
+import { clearanceForAgent, DEFAULT_COMMIT_REACH } from './confined-access.js';
 
 export const WALK_SPEED = 2.2;          // m/s on rubble
-export const CRAWL_SPEED = 0.95;        // m/s while crouched
+export const CRAWL_SPEED = 0.95;        // m/s while crouched (upright squat)
+export const PRONE_SPEED = 0.45;        // m/s elbow-crawl — slower than squat crawl
 export const JUMP_SPEED = 5.2;          // m/s — enough apex to reach ledges / 1 m landings
 export const GRAVITY = 18;              // m/s² — slightly juicy for game feel on kinematic body
 export const ACCESS_RADIUS = 0.6;       // m — touch distance to count VICTIM_ACCESSED
+export const COMMIT_DURATION = 2.5;     // s — assisted squeeze into the pocket
+export const COMMIT_REACH = DEFAULT_COMMIT_REACH;
+
+// Half-angle factors for prone pitch(+π/2) — capsule long axis → heading.
+const PRONE_PITCH_S = Math.sin(Math.PI / 4);
+const PRONE_PITCH_C = Math.cos(Math.PI / 4);
 
 // Locomotion constraints (DEVLOG 2026-08-01)
 export const MAX_SLOPE_DEG = 30;        // walk / land / grab — steeper → slide
@@ -80,7 +93,12 @@ export class RescuerAgent {
     this.ladderRide = null;      // { ladder, t }  t ∈ [0,1] along length
     this.victims = [];           // { id, x, y, z, voidRef, lost, ingressUnlocked }
     this.jumpOrigin = null;      // { x, y, z, feetY } when Space starts a jump
-    this.crouched = false;       // hold Shift/Z — shorter capsule for crawl
+    this.crouched = false;       // hold Shift/Z — upright squat capsule for crawl
+    this.prone = false;          // hold X — horizontal elbow-crawl capsule
+    this.proneRiseLatched = false; // true after a failed X-release; clears when X pressed again
+    this.hasMadeIngress = false; // true once any cut opening has been entered
+    this.commit = null;          // { t, duration, from, to, victimId } while assisted squeeze
+    this.commitHintCd = 0;       // throttle COMMIT_READY status spam
     this.capHalf = CAPSULE_HALF;
     this.capRadius = CAPSULE_RADIUS;
     this.holeSlideCooldown = 0;   // avoid re-triggering fall while climbing out
@@ -125,12 +143,16 @@ export class RescuerAgent {
   }
 
   /**
-   * Create or replace the KCC capsule. Keeps feet planted when switching stand ↔ crouch
-   * by adjusting the body centre for the new half+radius.
+   * Create or replace the KCC capsule. Keeps feet planted when switching stand ↔ crouch ↔ prone
+   * by adjusting the body centre for the new half+radius (and orientation).
+   *
+   * When `opts.prone` is true, the Y-capsule is pitched flat along heading so the
+   * clearance height is ~2*radius instead of the full upright length.
    */
-  _buildCapsuleCollider(half, radius) {
+  _buildCapsuleCollider(half, radius, opts = {}) {
     const R = this.sim.R;
     const feet = this.body ? this.feetY() : null;
+    const wantProne = !!opts.prone;
     if (this.collider && this.sim?.world) {
       try {
         this.sim.colliderToPart.delete(this.collider.handle);
@@ -140,17 +162,21 @@ export class RescuerAgent {
     }
     this.capHalf = half;
     this.capRadius = radius;
+    this.prone = wantProne;
     const cd = R.ColliderDesc.capsule(half, radius)
       .setFriction(0.9)
       .setRestitution(0)
       .setDensity(0);
     this.collider = this.sim.world.createCollider(cd, this.body);
+    // Shape bookkeeping: upright uses hy = half+radius; prone uses hy = radius (envelope height).
+    const hy = wantProne ? radius : (half + radius);
+    const hx = wantProne ? (half + radius) : radius;
     if (!this.part) {
       this.part = {
         body: this.body,
         col: this.collider,
         colliders: [this.collider],
-        shape: { hx: radius, hy: half + radius, hz: radius },
+        shape: { hx, hy, hz: hx },
         kind: 'rescuer',
         matKind: 'rescuer',
         agent: true,
@@ -161,11 +187,14 @@ export class RescuerAgent {
     } else {
       this.part.col = this.collider;
       this.part.colliders = [this.collider];
-      this.part.shape = { hx: radius, hy: half + radius, hz: radius };
+      this.part.shape = { hx, hy, hz: hx };
     }
     this.sim.colliderToPart.set(this.collider.handle, this.part);
     if (feet != null) {
-      this._setPose({ x: this.translation().x, y: feet + half + radius, z: this.translation().z });
+      // Prone: centre sits one radius above the floor (long axis is horizontal).
+      // Upright: centre sits at half + radius (classic vertical capsule).
+      const centreY = wantProne ? (feet + radius) : (feet + half + radius);
+      this._setPose({ x: this.translation().x, y: centreY, z: this.translation().z });
     }
     this._syncSceneQueries();
   }
@@ -175,14 +204,29 @@ export class RescuerAgent {
 
   translation() { return this.body.translation(); }
 
-  /** Feet world Y (bottom of capsule). */
-  feetY() {
-    const t = this.translation();
-    return t.y - this.capHalf - this.capRadius;
+  /**
+   * Vertical offset from feet to capsule centre for the current pose.
+   * Prone: just radius. Upright: half + radius.
+   */
+  centreOffset() {
+    return this.prone ? this.capRadius : (this.capHalf + this.capRadius);
   }
 
-  /** Standing height of the current capsule (m). */
+  /**
+   * Feet world Y (bottom of capsule).
+   * Prone horizontal capsule: lowest point is centre − radius.
+   * Upright: centre − half − radius.
+   */
+  feetY() {
+    const t = this.translation();
+    return t.y - this.centreOffset();
+  }
+
+  /**
+   * Vertical envelope of the current capsule (m) — what overhead / void height must clear.
+   */
   capsuleHeight() {
+    if (this.prone) return this.capRadius * 2;
     return this.capHalf * 2 + this.capRadius * 2;
   }
 
@@ -194,14 +238,16 @@ export class RescuerAgent {
     const t = this.translation();
     return {
       x: t.x, z: t.z, feetY: this.feetY(), yaw: this.yaw,
-      crouched: this.crouched, height: this.capsuleHeight(),
+      crouched: this.crouched, prone: this.prone, height: this.capsuleHeight(),
     };
   }
 
   /**
-   * Hold-to-crouch. Standing up requires clear overhead; otherwise stay crouched.
+   * Hold-to-crouch (upright squat). Standing up requires clear overhead; otherwise stay crouched.
+   * Ignored while prone — X owns the low-void pose.
    */
   setCrouch(want) {
+    if (this.prone) return;
     if (want === this.crouched) return;
     if (want) {
       this._buildCapsuleCollider(CROUCH_HALF, CROUCH_RADIUS);
@@ -219,21 +265,110 @@ export class RescuerAgent {
     this.emit({ type: 'RESCUER_CROUCH', crouched: false });
   }
 
+  /**
+   * Hold X for prone / elbow-crawl. On release, auto-pick stand or crouch by headroom;
+   * if neither fits, stay prone and emit RESCUER_PRONE_BLOCKED once (not every frame —
+   * otherwise the status line overwrites ✓ victim reached while the player holds/releases X).
+   */
+  setProne(want) {
+    if (want === this.prone) {
+      // Holding X again after a blocked rise clears the latch so a later release can retry.
+      if (want) this.proneRiseLatched = false;
+      return;
+    }
+    if (want) {
+      // Leave any upright crouch flag — the prone capsule replaces it.
+      this.crouched = false;
+      this.proneRiseLatched = false;
+      this._buildCapsuleCollider(PRONE_HALF, PRONE_RADIUS, { prone: true });
+      this.mode = 'prone';
+      // Softer autostep so the horizontal capsule does not hop onto debris rims.
+      if (this.controller) {
+        this.controller.enableAutostep(0.12, 0.08, true);
+        this.controller.enableSnapToGround(0.2);
+      }
+      this.emit({ type: 'RESCUER_PRONE', prone: true });
+      return;
+    }
+    // Release X: try stand first, then crouch, else stay prone.
+    if (this._canStandHereFromProne()) {
+      this._buildCapsuleCollider(CAPSULE_HALF, CAPSULE_RADIUS, { prone: false });
+      this.crouched = false;
+      this.prone = false;
+      this.proneRiseLatched = false;
+      this._restoreWalkAids();
+      this.mode = 'idle';
+      this.emit({ type: 'RESCUER_PRONE', prone: false, pose: 'stand' });
+      return;
+    }
+    if (this._canCrouchHereFromProne()) {
+      this._buildCapsuleCollider(CROUCH_HALF, CROUCH_RADIUS, { prone: false });
+      this.crouched = true;
+      this.prone = false;
+      this.proneRiseLatched = false;
+      this._restoreWalkAids();
+      this.mode = 'crouch';
+      this.emit({ type: 'RESCUER_PRONE', prone: false, pose: 'crouch' });
+      return;
+    }
+    // Stay prone — emit blocked only once per failed release attempt.
+    if (!this.proneRiseLatched) {
+      this.proneRiseLatched = true;
+      this.emit({ type: 'RESCUER_PRONE_BLOCKED' });
+    }
+  }
+
+  /** Restore default snap / autostep after leaving prone (unless hole-sliding). */
+  _restoreWalkAids() {
+    if (this.holeSliding) return;
+    if (!this.controller) return;
+    this.controller.enableSnapToGround(0.35);
+    this.controller.enableAutostep(0.45, 0.2, true);
+  }
+
   /** True if a standing capsule fits above the current feet without hitting solid. */
   _canStandHere() {
     const feet = this.feetY();
     const t = this.translation();
     const standTop = feet + CAPSULE_HALF * 2 + CAPSULE_RADIUS * 2;
-    // Start above the crouch crown + probe radius so we never overlap our own capsule.
-    const probeR = Math.min(CROUCH_RADIUS, CAPSULE_RADIUS) * 0.7;
-    const crouchTop = feet + this.capsuleHeight();
+    // Start above the current crown + probe radius so we never overlap our own capsule.
+    const probeR = Math.min(this.capRadius, CAPSULE_RADIUS) * 0.7;
+    const crown = feet + this.capsuleHeight();
+    return this._overheadClear(t.x, t.z, crown, standTop, probeR);
+  }
+
+  /**
+   * From prone, standing clearance uses the same probes but the current crown is only ~0.44 m.
+   */
+  _canStandHereFromProne() {
+    return this._canStandHere();
+  }
+
+  /**
+   * True if the upright crouch capsule (~0.88 m) fits above current feet.
+   * Used when releasing prone under a soffit that blocks standing but allows squat.
+   */
+  _canCrouchHereFromProne() {
+    const feet = this.feetY();
+    const t = this.translation();
+    const crouchTop = feet + CROUCH_HEIGHT;
+    const probeR = Math.min(PRONE_RADIUS, CROUCH_RADIUS) * 0.7;
+    const crown = feet + this.capsuleHeight();
+    return this._overheadClear(t.x, t.z, crown, crouchTop, probeR);
+  }
+
+  /**
+   * Ball-probe a vertical column from just above `fromY` up to `toY` for solid hits
+   * (excluding our own body). Returns true if the column is clear.
+   */
+  _overheadClear(x, z, fromY, toY, probeR) {
+    if (toY <= fromY + probeR) return true;
     const R = this.sim.R;
     const ball = new R.Ball(probeR);
     const rot = { x: 0, y: 0, z: 0, w: 1 };
-    for (let y = crouchTop + probeR + 0.04; y <= standTop - probeR; y += 0.1) {
-      // Exclude our own body — otherwise the crouch capsule always "blocks" standing.
+    for (let y = fromY + probeR + 0.04; y <= toY - probeR; y += 0.1) {
       const hit = this.sim.world.intersectionWithShape(
-        { x: t.x, y, z: t.z }, rot, ball,
+        { x, y, z }, rot, ball,
         undefined, undefined, undefined, this.body,
       );
       if (hit !== null) return false;
@@ -276,7 +411,7 @@ export class RescuerAgent {
     const hy = hit.part?.shape?.hy ?? 0.11;
     // Capsule centre clearly under the slab underside — past snap range and past frame colliders.
     const clearFeetY = hit.y - hy - 0.28;
-    const centreY = clearFeetY + this.capHalf + this.capRadius;
+    const centreY = clearFeetY + this.centreOffset();
 
     this.jumpOrigin = { x: t.x, y: t.y, z: t.z, feetY: feet };
     this._setHoleFallAids(true);
@@ -300,7 +435,15 @@ export class RescuerAgent {
   _endHoleSlide() {
     if (!this.holeSliding) return;
     this.holeSliding = false;
-    this._setHoleFallAids(false);
+    if (this.prone) {
+      // Keep the softer prone aids rather than snapping back to walk autostep.
+      if (this.controller) {
+        this.controller.enableAutostep(0.12, 0.08, true);
+        this.controller.enableSnapToGround(0.2);
+      }
+    } else {
+      this._setHoleFallAids(false);
+    }
   }
 
   /**
@@ -347,15 +490,41 @@ export class RescuerAgent {
   /**
    * Apply pose immediately (frozen world may not step) and queue for the next Rapier step.
    * Always refresh the query pipeline afterward so the next KCC / raycast sees us here.
+   *
+   * When prone, compose yaw × pitch(+π/2) so the Y-capsule's long axis lies along heading
+   * (+Z at yaw 0). Upright poses use yaw only.
    */
   _setPose(pos, yaw = this.yaw) {
     this.body.setTranslation(pos, true);
     this.body.setNextKinematicTranslation(pos);
-    const half = yaw * 0.5;
-    const rot = { x: 0, y: Math.sin(half), z: 0, w: Math.cos(half) };
+    const rot = this.prone ? this._proneQuat(yaw) : this._yawQuat(yaw);
     this.body.setRotation(rot, true);
     this.body.setNextKinematicRotation(rot);
     this._syncSceneQueries();
+  }
+
+  /** Yaw-only quaternion (upright capsule). */
+  _yawQuat(yaw) {
+    const half = yaw * 0.5;
+    return { x: 0, y: Math.sin(half), z: 0, w: Math.cos(half) };
+  }
+
+  /**
+   * Yaw × pitch(+π/2): maps local +Y (capsule axis) onto world heading in XZ.
+   * Quaternion multiply qy * qp with qp = pitch π/2 about X.
+   */
+  _proneQuat(yaw) {
+    const h = yaw * 0.5;
+    const sy = Math.sin(h);
+    const cy = Math.cos(h);
+    const s = PRONE_PITCH_S;
+    const c = PRONE_PITCH_C;
+    return {
+      x: cy * s,
+      y: sy * c,
+      z: -sy * s,
+      w: cy * c,
+    };
   }
 
   /**
@@ -396,17 +565,31 @@ export class RescuerAgent {
 
   /**
    * Input snapshot from the renderer:
-   *   { forward, back, left, right, jump, interact, crouch, camForward, camRight, loadkN }
+   *   { forward, back, left, right, jump, interact, crouch, prone, camForward, camRight, loadkN }
    */
   step(dt, input = {}) {
     if (!this.body) return;
     const loadkN = input.loadkN ?? this.sim.opts.rescuerLoad ?? 1.2;
     this.bumpCooldown = Math.max(0, this.bumpCooldown - dt);
     this.holeSlideCooldown = Math.max(0, this.holeSlideCooldown - dt);
+    this.commitHintCd = Math.max(0, this.commitHintCd - dt);
 
+    // Assisted commit is player-independent — ignore pose toggles until it finishes.
+    if (this.mode === 'commit') {
+      this._stepCommit(dt, loadkN);
+      return;
+    }
+
+    // Hold X for prone / elbow-crawl (preferred over Shift crouch when both held).
     // Hold Shift or Z to crouch / crawl (C is Collapse; Ctrl fights browser shortcuts).
     if (this.mode !== 'mantle' && this.mode !== 'ladder') {
-      this.setCrouch(!!input.crouch);
+      if (input.prone) {
+        this.setProne(true);
+      } else if (this.prone) {
+        this.setProne(false);
+      } else {
+        this.setCrouch(!!input.crouch);
+      }
     }
 
     if (this.mode === 'mantle') {
@@ -423,7 +606,7 @@ export class RescuerAgent {
     }
 
     // --- horizontal wish from camera-relative WASD --------------------------------
-    const speed = this.crouched ? CRAWL_SPEED : WALK_SPEED;
+    const speed = this.prone ? PRONE_SPEED : (this.crouched ? CRAWL_SPEED : WALK_SPEED);
     let mx = 0, mz = 0;
     const f = input.camForward || { x: 0, z: 1 };
     const r = input.camRight || { x: 1, z: 0 };
@@ -435,13 +618,17 @@ export class RescuerAgent {
     if (len > 1e-6) {
       mx = (mx / len) * speed * dt;
       mz = (mz / len) * speed * dt;
-      this.walkPhase += dt * (this.crouched ? 5 : 8);
-      if (this.mode !== 'jump') this.mode = this.crouched ? 'crawl' : 'walk';
-    } else if (this.mode === 'walk' || this.mode === 'crawl') {
-      this.mode = this.crouched ? 'crouch' : 'idle';
-    } else if (this.crouched && (this.mode === 'idle' || !this.mode)) {
+      this.walkPhase += dt * (this.prone ? 4 : (this.crouched ? 5 : 8));
+      if (this.mode !== 'jump') {
+        this.mode = this.prone ? 'elbow' : (this.crouched ? 'crawl' : 'walk');
+      }
+    } else if (this.mode === 'walk' || this.mode === 'crawl' || this.mode === 'elbow') {
+      this.mode = this.prone ? 'prone' : (this.crouched ? 'crouch' : 'idle');
+    } else if (this.prone && (this.mode === 'idle' || this.mode === 'crouch' || !this.mode)) {
+      this.mode = 'prone';
+    } else if (this.crouched && !this.prone && (this.mode === 'idle' || !this.mode)) {
       this.mode = 'crouch';
-    } else if (!this.crouched && this.mode === 'crouch') {
+    } else if (!this.crouched && !this.prone && this.mode === 'crouch') {
       this.mode = 'idle';
     }
 
@@ -461,15 +648,16 @@ export class RescuerAgent {
       const tProbe = this.translation();
       const overCut = this.sim.passableOpeningAt(tProbe.x, this.feetY() + 0.05, tProbe.z, 0.88);
       if (overCut) this._setHoleFallAids(true);
-      else this._setHoleFallAids(false);
+      else if (!this.prone) this._setHoleFallAids(false);
     }
     this._tryHoleSlide(groundedBefore);
 
     if (groundedBefore && this.mode === 'jump' && !this.holeSliding) {
       // Landing handled after movement — keep mode jump until we resolve the land.
     }
-    // No jump while crouched — stand first. Hole-slide already set mode=jump.
-    if (this.locoReady && groundedBefore && input.jump && this.mode !== 'jump' && !this.crouched && !this.holeSliding) {
+    // No jump while crouched or prone — stand first. Hole-slide already set mode=jump.
+    if (this.locoReady && groundedBefore && input.jump && this.mode !== 'jump'
+      && !this.crouched && !this.prone && !this.holeSliding) {
       const t0 = this.translation();
       this.jumpOrigin = { x: t0.x, y: t0.y, z: t0.z, feetY: this.feetY() };
       this.vVel = JUMP_SPEED;
@@ -509,7 +697,9 @@ export class RescuerAgent {
       this._resolveJumpLanding();
       this._endHoleSlide();
     } else if (groundedAfter && this.mode === 'jump') {
-      this.mode = len > 1e-6 ? (this.crouched ? 'crawl' : 'walk') : (this.crouched ? 'crouch' : 'idle');
+      this.mode = len > 1e-6
+        ? (this.prone ? 'elbow' : (this.crouched ? 'crawl' : 'walk'))
+        : (this.prone ? 'prone' : (this.crouched ? 'crouch' : 'idle'));
       this.jumpOrigin = null;
       this._endHoleSlide();
     }
@@ -523,12 +713,18 @@ export class RescuerAgent {
     this._updateLiveLoad(loadkN, groundedAfter);
     this._maybeWake(dt, len > 1e-6 || this.mode === 'jump');
 
-    if (input.interact && this.mode !== 'jump' && !this.crouched) {
-      if (!this._tryMantle()) this._tryMountLadder();
+    // E while prone: try assisted commit. E upright: mantle / ladder (not while crouched).
+    if (input.interact && this.mode !== 'jump') {
+      if (this.prone) {
+        this._tryCommit();
+      } else if (!this.crouched) {
+        if (!this._tryMantle()) this._tryMountLadder();
+      }
     }
 
     this._checkOpeningIngress();
     this._checkVictimAccess();
+    this._maybeCommitHint();
   }
 
   /**
@@ -705,10 +901,11 @@ export class RescuerAgent {
   }
 
   _startMantle(target) {
-    // Pull-ups need full standing height — leave crouch before climbing.
+    // Pull-ups need full standing height — leave crouch / prone before climbing.
+    if (this.prone) this.setProne(false);
     if (this.crouched) this.setCrouch(false);
     const t = this.translation();
-    const landY = target.topY + this.capHalf + this.capRadius + 0.02;
+    const landY = target.topY + this.centreOffset() + 0.02;
     this.mantle = {
       t: 0,
       duration: MANTLE_DURATION,
@@ -848,6 +1045,119 @@ export class RescuerAgent {
     }
   }
 
+  // ---- assisted commit (prone → victim) -----------------------------------------
+
+  /**
+   * While prone, hint once every few seconds if any unlocked victim has a clear path.
+   */
+  _maybeCommitHint() {
+    if (!this.prone || this.commitHintCd > 0) return;
+    for (const v of this.victims) {
+      if (v.lost || this.accessed.has(v.id) || !v.ingressUnlocked) continue;
+      const result = clearanceForAgent(this, v, { commitReach: COMMIT_REACH, proneHeight: PRONE_HEIGHT });
+      if (result.ok) {
+        this.commitHintCd = 3.5;
+        this.emit({ type: 'COMMIT_READY', victimId: v.id });
+        return;
+      }
+    }
+  }
+
+  /**
+   * E while prone: clearance-gated assisted squeeze. Fail → explicit reason (no teleport).
+   */
+  _tryCommit() {
+    let best = null;
+    let bestDist = COMMIT_REACH + 0.01;
+    let failReason = 'too_far';
+    for (const v of this.victims) {
+      if (v.lost || this.accessed.has(v.id)) continue;
+      const t = this.translation();
+      const d = Math.hypot(t.x - v.x, t.z - v.z);
+      const result = clearanceForAgent(this, v, { commitReach: COMMIT_REACH, proneHeight: PRONE_HEIGHT });
+      if (result.ok && d < bestDist) {
+        best = v;
+        bestDist = d;
+      } else if (!result.ok && d < COMMIT_REACH + 0.5) {
+        // Prefer a nearby fail reason over a distant "too_far".
+        failReason = result.reason || failReason;
+      }
+    }
+    if (!best) {
+      this.emit({ type: 'COMMIT_FAIL', reason: failReason });
+      return false;
+    }
+    this._startCommit(best);
+    return true;
+  }
+
+  /** Begin the 2–3 s player-independent squeeze toward the victim. */
+  _startCommit(victim) {
+    const t = this.translation();
+    // End pose: prone capsule centre beside the victim (same floor band).
+    const endFeet = (victim.voidRef?.floorY ?? (victim.y - 0.07));
+    const endY = endFeet + this.capRadius;
+    const dx = victim.x - t.x;
+    const dz = victim.z - t.z;
+    const dist = Math.hypot(dx, dz) || 1;
+    // Stop a touch short so we land inside ACCESS_RADIUS without overlapping the figure.
+    const stop = Math.max(0.2, Math.min(dist, ACCESS_RADIUS * 0.85));
+    const ux = dx / dist;
+    const uz = dz / dist;
+    this.commit = {
+      t: 0,
+      duration: COMMIT_DURATION,
+      victimId: victim.id,
+      from: { x: t.x, y: t.y, z: t.z },
+      to: {
+        x: victim.x - ux * stop,
+        y: endY,
+        z: victim.z - uz * stop,
+      },
+    };
+    // Face the victim for the squeeze theatre.
+    this.yaw = Math.atan2(dx, dz);
+    this.mode = 'commit';
+    this.vVel = 0;
+    this.emit({ type: 'COMMIT_START', victimId: victim.id, duration: COMMIT_DURATION });
+  }
+
+  /** Scripted lerp (ease-in-out) then award VICTIM_ACCESSED if still valid. */
+  _stepCommit(dt, loadkN) {
+    const c = this.commit;
+    if (!c) {
+      this.mode = this.prone ? 'prone' : 'idle';
+      return;
+    }
+    c.t += dt;
+    const u = Math.min(1, c.t / c.duration);
+    const s = u * u * (3 - 2 * u);
+    const x = c.from.x + (c.to.x - c.from.x) * s;
+    const y = c.from.y + (c.to.y - c.from.y) * s;
+    const z = c.from.z + (c.to.z - c.from.z) * s;
+    this._setPose({ x, y, z });
+    this.walkPhase += dt * 5;
+    this._updateLiveLoad(loadkN, true);
+
+    if (u >= 1) {
+      const victimId = c.victimId;
+      this.commit = null;
+      this.mode = 'prone';
+      // Ensure prone capsule after the scripted move (in case something flipped flags).
+      if (!this.prone) {
+        this._buildCapsuleCollider(PRONE_HALF, PRONE_RADIUS, { prone: true });
+      }
+      // Award access only if ingress still holds and victim not lost.
+      for (const v of this.victims) {
+        if (v.id !== victimId || v.lost || this.accessed.has(v.id)) continue;
+        if (!v.ingressUnlocked) continue;
+        this.accessed.add(v.id);
+        this.emit({ type: 'VICTIM_ACCESSED', victimId: v.id, x: v.x, y: v.y, z: v.z, via: 'commit' });
+      }
+      this.emit({ type: 'COMMIT_DONE', victimId });
+    }
+  }
+
   // ---- ladder -------------------------------------------------------------------
 
   _tryMountLadder() {
@@ -960,6 +1270,8 @@ export class RescuerAgent {
       lost: false,
       ingressUnlocked: !!v.ingressUnlocked,
     }));
+    // Fresh victim list — ingress must be re-proven through a cut (unless a test pre-unlocked).
+    if (!list.some((v) => v.ingressUnlocked)) this.hasMadeIngress = false;
   }
 
   markVoidCompromised(voidObj) {
@@ -973,31 +1285,41 @@ export class RescuerAgent {
 
   /**
    * If the capsule is inside / through a registered cutter or hammer opening, unlock
-   * victims whose voids sit under or near that opening.
+   * victims whose voids sit under or near that opening. Also latches `hasMadeIngress`
+   * so later crawling into a connected side pocket can unlock that pocket's survivor.
    */
   _checkOpeningIngress() {
     if (!this.sim?.openingIngressAt || !this.victims.length) return;
     const t = this.translation();
     const hit = this.sim.openingIngressAt(
       t.x, t.y, t.z,
-      this.capHalf + this.capRadius,
+      this.centreOffset(),
     );
-    if (!hit) return;
-    this._unlockVictimsNearOpening(hit);
+    if (hit) {
+      this.hasMadeIngress = true;
+      this._unlockVictimsNearOpening(hit);
+    }
+    // After proving a cut entry once, unlock any void the rescuer is physically occupying
+    // (side pocket the hole association missed because it was >2 m laterally).
+    if (this.hasMadeIngress) this._unlockVictimsInOccupiedVoid();
   }
 
   /**
    * Associate an opening with nearby voids that lie at or below it, and mark those
    * victims as enterable for scoring.
+   *
+   * Reach is generous on purpose: the cut is often beside the survivor pocket (side void),
+   * not directly above the victim mesh.
    */
   _unlockVictimsNearOpening(opening) {
-    const margin = 1.0;
+    const margin = 2.5;
     for (const v of this.victims) {
       if (v.lost || v.ingressUnlocked) continue;
       const vr = v.voidRef;
       if (!vr) continue;
       // Void pocket should be at or below the opening (searching downward into rubble).
-      if (vr.y > opening.y + 0.75) continue;
+      const voidY = vr.y ?? ((vr.floorY ?? 0) + (vr.height ?? vr.h ?? 1) * 0.5);
+      if (voidY > opening.y + 1.0) continue;
       const dist = Math.hypot(vr.x - opening.x, vr.z - opening.z);
       const reach = (vr.radius || 0.5) + opening.radius + margin;
       if (dist <= reach) {
@@ -1008,15 +1330,69 @@ export class RescuerAgent {
   }
 
   /**
+   * Unlock victims whose void footprint currently contains the rescuer's feet.
+   * Only runs after `hasMadeIngress` — proves the player cut their way in somewhere,
+   * then searched into this pocket (training goal), without requiring the void centre
+   * to sit within a fixed radius of the hole.
+   */
+  _unlockVictimsInOccupiedVoid() {
+    const feet = this.feetY();
+    const t = this.translation();
+    for (const v of this.victims) {
+      if (v.lost || v.ingressUnlocked) continue;
+      const vr = v.voidRef;
+      if (!vr) continue;
+      const r = (vr.radius || 0.6) + 0.35;
+      if (Math.hypot(t.x - vr.x, t.z - vr.z) > r) continue;
+      const fy = vr.floorY ?? (vr.y - (vr.height ?? vr.h ?? 1) * 0.5);
+      // Same floor band as the pocket (allow standing in the hole shaft above floorY).
+      if (feet < fy - 0.35 || feet > fy + (vr.height ?? vr.h ?? 1) + 0.35) continue;
+      v.ingressUnlocked = true;
+      this.emit({ type: 'INGRESS_UNLOCKED', victimId: v.id, x: vr.x, y: vr.y, z: vr.z, via: 'occupy' });
+    }
+  }
+
+  /**
+   * Horizontal distance from the rescuer's touch volume to the victim.
+   * Prone: closest point on the long-axis segment (head↔feet), so a survivor by the
+   * legs still counts when the capsule centre is a body-length away.
+   */
+  _touchDistanceHorizontal(v) {
+    const t = this.translation();
+    if (!this.prone) return Math.hypot(t.x - v.x, t.z - v.z);
+    const halfLen = this.capHalf + this.capRadius;
+    const fx = Math.sin(this.yaw);
+    const fz = Math.cos(this.yaw);
+    const ax = t.x - halfLen * fx;
+    const az = t.z - halfLen * fz;
+    const bx = t.x + halfLen * fx;
+    const bz = t.z + halfLen * fz;
+    const abx = bx - ax;
+    const abz = bz - az;
+    const ab2 = abx * abx + abz * abz || 1;
+    let u = ((v.x - ax) * abx + (v.z - az) * abz) / ab2;
+    u = Math.max(0, Math.min(1, u));
+    return Math.hypot(v.x - (ax + abx * u), v.z - (az + abz * u));
+  }
+
+  /**
    * Score +1 only when the rescuer is within touch range of a victim whose void was
    * unlocked by entering a cut opening, and the void is not compromised.
+   *
+   * Uses horizontal distance to the body (prone segment) + a vertical band — not raw 3D
+   * centre distance, which burned ACCESS_RADIUS on ΔY alone.
    */
   _checkVictimAccess() {
     const t = this.translation();
+    // Distance is already to the body axis when prone, so ACCESS_RADIUS alone is the touch pad.
+    const maxDist = this.prone
+      ? ACCESS_RADIUS + this.capRadius
+      : ACCESS_RADIUS + this.capRadius;
+    const maxDy = this.prone ? 0.9 : 1.35;
     for (const v of this.victims) {
       if (v.lost || this.accessed.has(v.id) || !v.ingressUnlocked) continue;
-      const d = Math.hypot(t.x - v.x, t.y - v.y, t.z - v.z);
-      if (d <= ACCESS_RADIUS + CAPSULE_RADIUS) {
+      if (Math.abs(t.y - v.y) > maxDy) continue;
+      if (this._touchDistanceHorizontal(v) <= maxDist) {
         this.accessed.add(v.id);
         this.emit({ type: 'VICTIM_ACCESSED', victimId: v.id, x: v.x, y: v.y, z: v.z });
       }
@@ -1025,6 +1401,7 @@ export class RescuerAgent {
 
   /** Test helper: force-unlock a victim for ingress (skips hole transit). */
   unlockVictimIngress(victimId) {
+    this.hasMadeIngress = true;
     for (const v of this.victims) {
       if (v.id === victimId || victimId == null) v.ingressUnlocked = true;
     }
@@ -1101,7 +1478,7 @@ export class RescuerAgent {
     }
     this._setPose({
       x: t.x,
-      y: groundY + this.capHalf + this.capRadius + 0.02,
+      y: groundY + this.centreOffset() + 0.02,
       z: t.z,
     });
     // Latch onto the floor with a short downward wish so grounding is real, not assumed.

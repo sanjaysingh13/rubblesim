@@ -1764,10 +1764,8 @@ export class RubbleSim {
   }
 
   /**
-   * Cutting torch / saw — specs.md §3.1.2 verbatim: find the structural joint intersecting the
-   * cut and remove it with `world.removeImpulseJoint`. Unlike the hydraulic pliers (which only
-   * reach rebar ALREADY exposed at a fracture), a torch cuts any joint within reach, including
-   * still-embedded slab ties and member welds. Returns {severed, points, woken}.
+   * Generic joint burner (legacy / tests): find any structural joint of the given types within
+   * reach and remove it. Prefer cutBeamNear for the oxy-acetylene torch (beams only).
    */
   cutJointNear(point, reach, { types = ['tie', 'member'] } = {}) {
     let best = null, bd = reach * reach;
@@ -1786,6 +1784,37 @@ export class RubbleSim {
     this.stats.cuts++;
     this.phase = 'collapsing';
     return { severed: 1, points: [{ x: best.x, y: best.y, z: best.z }], woken };
+  }
+
+  /**
+   * Oxy-acetylene torch: melt a steel BEAM member joint within reach.
+   * Refuses slab ties and column welds — those are concrete / different tools. Returns the
+   * member so callers can run along-beam heat compromise (torch-heat.js).
+   */
+  cutBeamNear(point, reach) {
+    let best = null, bd = reach * reach;
+    for (const rec of this.joints) {
+      if (rec.broken || rec.a.dead || rec.b.dead) continue;
+      if (rec.type !== 'member' || !rec.member || rec.member.kind !== 'beam') continue;
+      const pa = rec.a.body.translation(), pb = rec.b.body.translation();
+      const mid = { x: (pa.x + pb.x) / 2, y: (pa.y + pb.y) / 2, z: (pa.z + pb.z) / 2 };
+      const d2 = (mid.x - point.x) ** 2 + (mid.y - point.y) ** 2 + (mid.z - point.z) ** 2;
+      if (d2 <= bd) { bd = d2; best = { rec, ...mid }; }
+    }
+    if (!best) return { severed: 0, points: [], woken: 0, member: null, cutPoint: null };
+    this._breakJoint(best.rec);
+    const cutPoint = { x: best.x, y: best.y, z: best.z };
+    const woken = this._wakeNear(cutPoint, Math.max(reach * 3, 1.5));
+    this._markToolWake();
+    this.stats.cuts++;
+    this.phase = 'collapsing';
+    return {
+      severed: 1,
+      points: [cutPoint],
+      woken,
+      member: best.rec.member,
+      cutPoint,
+    };
   }
 
   /**
