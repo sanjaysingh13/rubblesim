@@ -1,4 +1,4 @@
-# RubbleSim Web
+# RubbleSim
 
 Browser-based Urban Search & Rescue rubble simulator — **the primary, go-forward
 implementation**. Models and collapses multi-story buildings, then detects the
