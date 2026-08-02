@@ -9,19 +9,33 @@
       * { margin: 0; padding: 0; box-sizing: border-box; }
       html, body { height: 100%; overflow: hidden; background: #0b0d10; font-family: system-ui, sans-serif; }
       #app { position: fixed; inset: 0; }
-      #hud {
+      /*
+        Left info column: HUD help text, live status line, then Structure / USAR score.
+        These used to be three separately `position: fixed` boxes with hard-coded `top`
+        values (208px / 268px). The HUD grew (rescuer keys, score rules, etc.) and those
+        fixed tops no longer cleared it, so Structure / USAR score painted on top of the
+        help text. One flex column stacks them by natural height instead.
+        max-height + overflow-y keeps a short viewport usable; the tool ring at the bottom
+        stays clear via the calc() reserve. lil-gui owns the right ~245px.
+      */
+      #left-panel {
         position: fixed; left: 12px; top: 12px; z-index: 10;
+        display: flex; flex-direction: column; gap: 8px;
+        width: 320px; max-width: calc(100vw - 270px);
+        max-height: calc(100vh - 96px);
+        overflow-y: auto;
+      }
+      #hud {
         color: #cdd6e0; font-size: 12px; line-height: 1.5;
         background: rgba(14,17,22,.72); border: 1px solid #222a33;
-        border-radius: 8px; padding: 10px 12px; max-width: 320px; pointer-events: none;
+        border-radius: 8px; padding: 10px 12px;
       }
       #hud b { color: #4fd6ff; }
       #hud .k { color: #9fb0c0; }
-      /* Left column: hud, then status, then the load readout. The right side belongs to lil-gui,
-         which is ~245px wide — anything placed there is simply hidden behind it. */
-      #status { position: fixed; left: 12px; top: 208px; z-index: 10; max-width: 320px;
+      #status {
         color: #4fd6ff; font-size: 12px; background: rgba(14,17,22,.72);
-        border: 1px solid #222a33; border-radius: 8px; padding: 6px 10px; }
+        border: 1px solid #222a33; border-radius: 8px; padding: 6px 10px;
+      }
       /* Tool ring (specs.md §4B): the active tool is global state, shown as a selectable ring. */
       #toolring {
         position: fixed; left: 50%; bottom: 16px; transform: translateX(-50%); z-index: 20;
@@ -46,12 +60,13 @@
       #toolring button[aria-pressed="true"] .kb { color: #6fe0aa; }
       /* Load readout: live engineering numbers for the active bags/shores. */
       #loads {
-        position: fixed; left: 12px; top: 268px; z-index: 10; width: 320px;
         color: #cdd6e0; font-size: 11px; line-height: 1.5; font-variant-numeric: tabular-nums;
         background: rgba(14,17,22,.78); border: 1px solid #222a33;
-        border-radius: 8px; padding: 8px 10px; pointer-events: none;
+        border-radius: 8px; padding: 8px 10px;
       }
-      #loads h4 { color: #4fd6ff; font-size: 11px; font-weight: 600; margin-bottom: 3px; }
+      /* Space sections (Structure, USAR score, bags…) so headings never sit on prior values. */
+      #loads h4 { color: #4fd6ff; font-size: 11px; font-weight: 600; margin: 8px 0 3px; }
+      #loads h4:first-child { margin-top: 0; }
       #loads .row { display: flex; justify-content: space-between; gap: 10px; }
       #loads .warn { color: #ffb347; }
       #loads .bad { color: #ff5c6c; }
@@ -61,23 +76,29 @@
   </head>
   <body>
     <div id="app"></div>
-    <div id="hud">
-      <div><b>RubbleSim Web</b> — three.js + Rapier PoC</div>
-      <div class="k">Confined-space void generation for USAR</div>
-      <hr style="border-color:#222a33;margin:6px 0" />
-      <div><span class="k">Drag</span> orbit &nbsp; <span class="k">Scroll</span> zoom</div>
-      <div><span class="k">P</span> regenerate &nbsp; <span class="k">F</span> freeze now &nbsp; <span class="k">R</span> rescuer</div>
-      <div><span class="k">S</span> stress map &nbsp; <span class="k">0-7</span> tool</div>
-      <div><span class="k">Right-click</span> cut / place at aim &nbsp; <span class="k">Left-drag</span> orbit</div>
-      <div>Tools unlock once a rescuer is on site — he carries them; right-click an eligible spot within arm's reach</div>
-      <div>Rescuer: <span class="k">WASD</span> move · <span class="k">drag</span> orbit · <span class="k">scroll</span> zoom · <span class="k">T</span> 1st/3rd</div>
-      <div><span class="k">Space</span> jump · <span class="k">Shift</span>/<span class="k">Z</span> crouch · <span class="k">E</span> pull-up/ladder · <span class="k">R</span> control</div>
-      <div>Score: +1 reach victim via cut hole · −1 ops-compromised void · jump into holes ≤2.5 m</div>
-      <div>Step onto a clear cutter / hammer+rebar hole to drop in · crouch to crawl low voids</div>
-      <div>Grey→red = stress / utilization</div>
+    <!--
+      Single left column so #hud / #status / #loads grow with their content and never
+      overlap. JS still finds them by id (getElementById) — the wrapper is layout only.
+    -->
+    <div id="left-panel">
+      <div id="hud">
+        <div><b>RubbleSim Web</b> — three.js + Rapier PoC</div>
+        <div class="k">Confined-space void generation for USAR</div>
+        <hr style="border-color:#222a33;margin:6px 0" />
+        <div><span class="k">Drag</span> orbit &nbsp; <span class="k">Scroll</span> zoom</div>
+        <div><span class="k">P</span> regenerate &nbsp; <span class="k">F</span> freeze now &nbsp; <span class="k">R</span> rescuer</div>
+        <div><span class="k">S</span> stress map &nbsp; <span class="k">0-7</span> tool</div>
+        <div><span class="k">Right-click</span> cut / place at aim &nbsp; <span class="k">Left-drag</span> orbit</div>
+        <div>Tools unlock once a rescuer is on site — he carries them; right-click an eligible spot within arm's reach</div>
+        <div>Rescuer: <span class="k">WASD</span> move · <span class="k">drag</span> orbit · <span class="k">scroll</span> zoom · <span class="k">T</span> 1st/3rd</div>
+        <div><span class="k">Space</span> jump · <span class="k">Shift</span>/<span class="k">Z</span> crouch · <span class="k">E</span> pull-up/ladder · <span class="k">R</span> control</div>
+        <div>Score: +1 reach victim via cut hole · −1 ops-compromised void · jump into holes ≤2.5 m</div>
+        <div>Step onto a clear cutter / hammer+rebar hole to drop in · crouch to crawl low voids</div>
+        <div>Grey→red = stress / utilization</div>
+      </div>
+      <div id="status">booting…</div>
+      <div id="loads"></div>
     </div>
-    <div id="status">booting…</div>
-    <div id="loads"></div>
     <div id="toolring"></div>
     <script type="module" src="/src/main.js"></script>
   </body>
