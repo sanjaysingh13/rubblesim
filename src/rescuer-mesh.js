@@ -291,6 +291,23 @@ export function syncRescuerMesh(group, translation, yaw, walkPhase = 0, mode = '
   const limbs = group.userData.limbs;
   if (!limbs) return;
 
+  // Crouch / crawl: squat the figure (scale + fold) so it matches the shorter capsule.
+  const crouched = mode === 'crouch' || mode === 'crawl';
+  if (crouched) {
+    group.scale.set(1, 0.62, 1.05);
+    limbs.leftLeg.rotation.x = 1.15;
+    limbs.rightLeg.rotation.x = 1.15;
+    limbs.leftArm.rotation.set(-0.9, 0, 0.2);
+    limbs.rightArm.rotation.set(-0.9, 0, -0.2);
+    if (mode === 'crawl') {
+      const swing = Math.sin(walkPhase) * 0.25;
+      limbs.leftLeg.rotation.x = 1.05 + swing;
+      limbs.rightLeg.rotation.x = 1.05 - swing;
+    }
+    return;
+  }
+  group.scale.set(1, 1, 1);
+
   // On a ladder / mantle, freeze the walk cycle and raise the arms slightly. Both hands are busy,
   // so an aim request is ignored — you do not run a cut-off saw one-handed off a ladder.
   if (mode === 'ladder' || mode === 'mantle') {

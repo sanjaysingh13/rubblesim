@@ -133,6 +133,11 @@ export const DEFAULTS = {
   // void detection
   voidGrid: 9,
   minVoidHeight: 0.9,      // only clearly survivable pockets
+  // Confined-pocket filter: victims only spawn where they could not simply walk out.
+  voidConfineRadius: 1.0,  // m — lateral probe distance for enclosure
+  voidConfineMinHits: 6,   // of 8 compass directions that must hit solid
+  voidRooftopMaxClear: 0.35, // m — reject if local pile top is this close above floorY
+  voidRooftopProbeR: 2.0,  // m — horizontal radius when sampling local pile top
 };
 
 // Convex hull of contact points projected onto the ground plane (monotone chain, CCW order).
@@ -354,10 +359,13 @@ const rodEnds = (d) => {
  * Does this part have an OPENING where rebar can span free of concrete?
  * Hammer breaches (through) and cutter holes both qualify.
  */
-const hasRebarOpening = (part) => !!(part && (part.hole || (part.breach && part.breach.through)));
+export const hasRebarOpening = (part) => !!(part && (part.hole || (part.breach && part.breach.through)));
 
-/** True if local (x,z) lies inside the part's open hole / breach footprint. */
-const inOpeningXZ = (part, x, z) => {
+/**
+ * True if local (x,z) lies inside the part's open hole / breach footprint.
+ * Exported so the rescuer ingress check and tests share the same geometry rule.
+ */
+export const inOpeningXZ = (part, x, z) => {
   if (part.breach && part.breach.through) {
     const b = part.breach;
     const dx = x - b.cx, dz = z - b.cz;
@@ -368,6 +376,13 @@ const inOpeningXZ = (part, x, z) => {
     return Math.abs(x - h.cx) <= h.rx && Math.abs(z - h.cz) <= h.rz;
   }
   return false;
+};
+
+/** Half-size used when associating an opening with nearby voids (m). */
+export const openingRadiusOf = (part) => {
+  if (part?.breach?.through) return part.breach.r;
+  if (part?.hole) return Math.max(part.hole.rx, part.hole.rz);
+  return 0.3;
 };
 
 /**
@@ -444,6 +459,11 @@ export class RubbleSim {
     // `yields` counts ties that gave way under SUSTAINED load rather than impact (see _yieldTiesOf).
     this.stats = { snaps: 0, cracks: 0, tears: 0, cuts: 0, yields: 0, maxForce: 0, maxBend: 0 };
     this.dustQueue = [];
+    // Through-openings the rescuer can enter (cutter holes / hammer breaches).
+    this.openings = [];
+    // Once a rescue tool wakes debris, subsequent void intrusions score as ops-compromised.
+    this.compromiseAttribution = false;
+    this.voids = [];
   }
 
   clear() { for (const p of this.parts) this.onRemove(p); this.world.free(); this.events.free(); this._init(); }
@@ -1471,6 +1491,7 @@ export class RubbleSim {
       }
     }
     this.stats.cuts++; this.phase = 'collapsing';
+    this._markToolWake();
     return { severed: 1, points, woken, snippedRod, brokeTie, dropped };
   }
 
@@ -1612,6 +1633,120 @@ export class RubbleSim {
   }
 
   /**
+   * Mark that a rescue tool has disturbed the pile. Later SURVIVOR_COMPROMISED events
+   * attributed to ops score −1; pre-tool / natural shifts still paint the void lost but
+   * do not change the game score.
+   */
+  _markToolWake() {
+    this.compromiseAttribution = true;
+  }
+
+  /**
+   * Remember a through-opening (concrete cutter hole or hammer breach) so the rescuer
+   * can prove ingress by physically crossing it.
+   */
+  _registerOpening(part) {
+    if (!part || part.dead || !hasRebarOpening(part)) return;
+    if (!this.openings.includes(part)) this.openings.push(part);
+  }
+
+  /**
+   * World-space centre and radius of a part's through-opening, or null if none.
+   */
+  openingWorld(part) {
+    if (!part?.body || !hasRebarOpening(part)) return null;
+    const t = part.body.translation(), q = part.body.rotation();
+    let cx = 0, cz = 0;
+    if (part.breach?.through) { cx = part.breach.cx; cz = part.breach.cz; }
+    else if (part.hole) { cx = part.hole.cx; cz = part.hole.cz; }
+    const off = rotateVec(q, { x: cx, y: 0, z: cz });
+    return {
+      x: t.x + off.x, y: t.y + off.y, z: t.z + off.z,
+      radius: openingRadiusOf(part),
+      part,
+    };
+  }
+
+  /**
+   * Can a rescuer physically drop / crawl through this opening?
+   * Concrete-cutter holes are clear (rebar already clipped). Hammer breaches need the
+   * spanning cage removed (rebar cutter) — any rod whose centre still sits in the opening
+   * blocks entry.
+   */
+  openingPassable(part) {
+    if (!part || part.dead || !hasRebarOpening(part)) return false;
+    if (part.hole) return true;
+    if (part.breach?.through) {
+      if (!part.rebars?.length) return true;
+      // Shrink slightly so edge stubs that barely kiss the circle do not count as blockers.
+      const b = part.breach;
+      const r2 = (b.r * 0.85) ** 2;
+      for (const d of part.rebars) {
+        const dx = d.x - b.cx, dz = d.z - b.cz;
+        if (dx * dx + dz * dz <= r2) return false;
+      }
+      return true;
+    }
+    return false;
+  }
+
+  /**
+   * Feet over a passable through-opening (cutter hole or cleared hammer breach)?
+   * Returns openingWorld or null. `inset` (0–1) shrinks the footprint so rim walking is safe.
+   */
+  passableOpeningAt(wx, wy, wz, inset = 0.82) {
+    for (const part of this.openings) {
+      if (!this.openingPassable(part) || !part.body) continue;
+      const t = part.body.translation(), q = part.body.rotation();
+      const local = invRotateVec(q, { x: wx - t.x, y: wy - t.y, z: wz - t.z });
+      // Temporary shrink of hole/breach for the test.
+      const savedHole = part.hole, savedBreach = part.breach;
+      if (part.hole) {
+        part.hole = {
+          cx: savedHole.cx, cz: savedHole.cz,
+          rx: savedHole.rx * inset, rz: savedHole.rz * inset,
+        };
+      } else if (part.breach) {
+        part.breach = { ...savedBreach, r: savedBreach.r * inset };
+      }
+      const inside = inOpeningXZ(part, local.x, local.z);
+      part.hole = savedHole;
+      part.breach = savedBreach;
+      if (!inside) continue;
+      // Feet should be near the slab band (standing on / just above the deck).
+      const hy = part.shape?.hy ?? 0.1;
+      if (local.y < -hy - 0.35 || local.y > hy + 0.55) continue;
+      return this.openingWorld(part);
+    }
+    return null;
+  }
+
+  /**
+   * Is a world point (typically the rescuer capsule centre) inside / through a registered
+   * opening? Requires the horizontal footprint match AND the point to be within / below
+   * the slab thickness band so walking *beside* a hole without dropping does not count.
+   *
+   * Returns the openingWorld descriptor, or null.
+   */
+  openingIngressAt(wx, wy, wz, capsuleHalf = 0.9) {
+    for (const part of this.openings) {
+      if (!part || part.dead || !part.body || !hasRebarOpening(part)) continue;
+      // Ingress unlock only counts once the opening is actually passable (rebar cleared).
+      if (!this.openingPassable(part)) continue;
+      const t = part.body.translation(), q = part.body.rotation();
+      const local = invRotateVec(q, { x: wx - t.x, y: wy - t.y, z: wz - t.z });
+      if (!inOpeningXZ(part, local.x, local.z)) continue;
+      const hy = part.shape?.hy ?? 0.1;
+      // Through the slab thickness, or clearly below it while still in the hole column.
+      const inBand = local.y <= hy + capsuleHalf && local.y >= -hy - capsuleHalf;
+      const below = local.y < -hy;
+      if (!inBand && !below) continue;
+      return this.openingWorld(part);
+    }
+    return null;
+  }
+
+  /**
    * Re-point one end of an existing joint onto a different body, preserving the record's state
    * (a cracked hinge stays a hinge). `delta` is the shift from the old body's origin to the new
    * one's, in the shared local frame, so the anchor keeps pointing at the same physical seam.
@@ -1647,6 +1782,7 @@ export class RubbleSim {
     if (!best) return { severed: 0, points: [], woken: 0 };
     this._breakJoint(best.rec);
     const woken = this._wakeNear(best, Math.max(reach * 3, 1.5));
+    this._markToolWake();
     this.stats.cuts++;
     this.phase = 'collapsing';
     return { severed: 1, points: [{ x: best.x, y: best.y, z: best.z }], woken };
@@ -1787,8 +1923,10 @@ export class RubbleSim {
       this._applyBreachFrame(part, b.cx, b.cz, b.r);
       if (!wasThrough) {
         this._wakeNear(wc, o.wakeRadius);
+        this._markToolWake();
         this.phase = 'collapsing';
       }
+      this._registerOpening(part);
     }
 
     this.stats.cuts++;
@@ -1834,6 +1972,7 @@ export class RubbleSim {
     if (rec) this._crackTie(rec);
     this._exposeRebar(target);
     this._wakeNear(point, this.opts.wakeRadius);
+    this._markToolWake();
     this.stats.cuts++;
     this.phase = 'collapsing';
     return { spalled, exposed: true, part: target };
@@ -1908,6 +2047,7 @@ export class RubbleSim {
     this.stats.cuts++;
     this.phase = 'collapsing';
     this._wakeNear(wpos, o.wakeRadius);
+    this._markToolWake();
     return { kept: slab, spawned };
   }
 
@@ -1969,12 +2109,16 @@ export class RubbleSim {
 
     // wake the local region so the plug and nearby debris re-settle
     this._wakeNear(wc, this.opts.wakeRadius);
+    this._markToolWake();
+    this._registerOpening(slab);
     this.stats.cuts++;
     this.phase = 'collapsing';
     return { plug, holeWorld: wc };
   }
 
-  // ray-march vertical lines; enclosed empty gaps (solid above) are internal voids
+  // ray-march vertical lines; enclosed empty gaps (solid above) are internal voids.
+  // Each void is also classified confined / open: only confined pockets get victims
+  // (rescuer must cut in). Open voids stay in the list for compromise AABB tracking.
   detectVoids() {
     const R = this.R, o = this.opts;
     let top = 0; for (const p of this.parts) top = Math.max(top, p.body.translation().y); top += 0.5;
@@ -1990,7 +2134,10 @@ export class RubbleSim {
       while (k < occ.length) {
         if (!occ[k][1]) { let j = k; while (j < occ.length && !occ[j][1]) j++;
           const y0 = occ[k][0], y1 = occ[j - 1][0], h = y1 - y0 + yStep;
-          if (y1 < topSolid - 1e-3 && h >= o.minVoidHeight) cand.push({ x, y: (y0 + y1) / 2, z, h });
+          // Centre y for AABB intrusion; floorY is where prone victims sit (no mid-air float).
+          if (y1 < topSolid - 1e-3 && h >= o.minVoidHeight) {
+            cand.push({ x, y: (y0 + y1) / 2, z, h, floorY: y0 });
+          }
           k = j; } else k++;
       }
     }
@@ -1998,9 +2145,77 @@ export class RubbleSim {
     const kept = [], md = cell * 0.9;
     for (const c of cand) {
       if (kept.some((v) => Math.hypot(v.x - c.x, v.z - c.z) < md && Math.abs(v.y - c.y) < c.h)) continue;
-      kept.push({ x: c.x, y: c.y, z: c.z, height: c.h, radius: Math.min(c.h, cell) / 2 });
+      const voidObj = {
+        x: c.x, y: c.y, z: c.z, height: c.h,
+        radius: Math.min(c.h, cell) / 2,
+        floorY: c.floorY,
+      };
+      voidObj.confined = this._isVoidConfined(voidObj, isSolid);
+      kept.push(voidObj);
     }
+    // Prefer deeper confined pockets first when consumers iterate for victims.
+    kept.sort((a, b) => {
+      if (a.confined !== b.confined) return a.confined ? -1 : 1;
+      return b.height - a.height;
+    });
     this.voids = kept;
     return kept;
+  }
+
+  /**
+   * Is this void a trapped pocket (victim cannot simply stand up and walk out)?
+   *
+   * Lateral: ≥ voidConfineMinHits of 8 compass probes hit solid within voidConfineRadius
+   * at torso height above the floor.
+   * Rooftop reject: local pile top within voidRooftopProbeR of the void xz is within
+   * voidRooftopMaxClear of floorY (open deck on top of the pile).
+   *
+   * Exported logic lives here so verify scripts can call sim._isVoidConfined with a stub
+   * isSolid, or use the real world after freeze.
+   */
+  _isVoidConfined(v, isSolid) {
+    const o = this.opts;
+    const radius = o.voidConfineRadius ?? 1.0;
+    const minHits = o.voidConfineMinHits ?? 6;
+    const roofClear = o.voidRooftopMaxClear ?? 0.35;
+    const roofR = o.voidRooftopProbeR ?? 2.0;
+    const floorY = v.floorY != null ? v.floorY : v.y - v.height / 2;
+    const torsoY = floorY + 0.45;
+
+    // --- rooftop open-floor reject ------------------------------------------------
+    // Sample a small grid around the void for the highest solid; if that top sits almost
+    // on the void floor, the "pocket" is really an exposed upper surface.
+    let localTop = floorY;
+    const step = Math.max(0.4, roofR / 3);
+    for (let dx = -roofR; dx <= roofR + 1e-6; dx += step) {
+      for (let dz = -roofR; dz <= roofR + 1e-6; dz += step) {
+        if (dx * dx + dz * dz > roofR * roofR + 1e-6) continue;
+        const px = v.x + dx, pz = v.z + dz;
+        // Walk upward from floor looking for the highest solid in this column.
+        for (let y = floorY + 0.1; y <= floorY + 4.0; y += 0.2) {
+          if (isSolid(px, y, pz)) localTop = Math.max(localTop, y);
+        }
+      }
+    }
+    if (localTop - floorY <= roofClear) return false;
+
+    // --- lateral enclosure --------------------------------------------------------
+    let hits = 0;
+    for (let i = 0; i < 8; i++) {
+      const ang = (i / 8) * Math.PI * 2;
+      const ux = Math.cos(ang), uz = Math.sin(ang);
+      let blocked = false;
+      // Step outward; any solid along the spoke counts as enclosure in that direction.
+      for (let d = 0.15; d <= radius + 1e-6; d += 0.15) {
+        if (isSolid(v.x + ux * d, torsoY, v.z + uz * d)) { blocked = true; break; }
+      }
+      if (blocked) hits++;
+    }
+    return hits >= minHits;
+  }
+
+  /** Confined voids only — preferred spawn sites for victims. */
+  confinedVoids() {
+    return (this.voids || []).filter((v) => v.confined);
   }
 }

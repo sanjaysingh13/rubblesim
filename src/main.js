@@ -31,7 +31,6 @@ const params = {
   ...DEFAULTS,
   standSeconds: 1.2,
   settleSeconds: 8,
-  showVoidMarkers: true,
   equipment: 'None',          // active tool label; the enum lives in src/equipment.js
   cutReach: 0.55,             // rebar-cutter mouth reach (m) — short (hydraulic pliers)
   holeSize: 0.6,             // concrete-cutter square side (m)
@@ -332,7 +331,8 @@ function clearSplinters() {
 // Sim wiring — a mesh per physics part
 // ---------------------------------------------------------------------------
 let sim;
-const voidMarkers = [];
+/** Detected survivable pockets — data only (no wireframe meshes). Victims sit on floorY. */
+const voidsList = [];
 let phase = 'idle';
 let timer = 0;
 let settleDuration = 8;   // seconds of re-settling before auto-freeze (collapse vs cut)
@@ -449,7 +449,7 @@ function onRebarChange(part) {
   if (part.rebarExposed) showRebar(part);
 }
 
-function clearMarkers() { for (const m of voidMarkers) markerGroup.remove(m); voidMarkers.length = 0; }
+function clearVoids() { voidsList.length = 0; }
 
 // --- lifting-bag rendering --------------------------------------------------------------------
 // A bag is a kinematic body in the physics world, not a `part`, so it gets its own mesh: a pillow
@@ -513,6 +513,8 @@ let rescuer = null;
 let rescuerMesh = null;
 const victimMeshes = [];
 let victimsAccessed = 0;
+/** Compromises that score −1 (only after a rescue tool woke the pile). */
+let rescuerCompromised = 0;
 const agentsGroup = new THREE.Group();
 scene.add(agentsGroup);
 
@@ -533,6 +535,7 @@ function clearRescuer() {
   for (const m of victimMeshes) { agentsGroup.remove(m); disposeRescuerMesh(m); }
   victimMeshes.length = 0;
   victimsAccessed = 0;
+  rescuerCompromised = 0;
   params.rescuerMode = false;
   // Restore free orbit over the pile.
   controls.enabled = true;
@@ -570,7 +573,7 @@ function placeShoulderCamera() {
 function placeEyeCamera() {
   if (!rescuer) return;
   const t = rescuer.translation();
-  const eyeY = rescuer.feetY() + EYE_HEIGHT;
+  const eyeY = rescuer.feetY() + rescuerEyeHeight();
   const fx = Math.sin(rescuer.yaw);
   const fz = Math.cos(rescuer.yaw);
   controls.target.set(t.x + fx * 0.15, eyeY, t.z + fz * 0.15);
@@ -629,7 +632,7 @@ function spawnRescuer() {
     rescuer.setVictims(victimMeshes.map((m, i) => ({
       id: `v${i}`, x: m.position.x, y: m.position.y, z: m.position.z, voidRef: m.userData.voidRef,
     })));
-  } else if (voidMarkers.length) {
+  } else if (voidsList.length) {
     spawnVictimMeshes();
   }
   params.rescuerMode = true;
@@ -646,6 +649,11 @@ function attachVictimsFromMarkers() {
 
 /** Eye height above the soles of the boots — roughly a standing adult. */
 const EYE_HEIGHT = 1.65;
+const EYE_HEIGHT_CROUCH = 0.72;
+
+function rescuerEyeHeight() {
+  return (rescuer && rescuer.crouched) ? EYE_HEIGHT_CROUCH : EYE_HEIGHT;
+}
 
 /**
  * Each frame: keep the orbit *target* on the rescuer so pan/zoom/tilt stay meaningful
@@ -657,7 +665,7 @@ function updateRescuerCamera(dt) {
   const t = rescuer.translation();
   const k = Math.min(1, dt * 10);
   if (params.rescuerView === 'first') {
-    const eyeY = rescuer.feetY() + EYE_HEIGHT;
+    const eyeY = rescuer.feetY() + rescuerEyeHeight();
     const fx = Math.sin(rescuer.yaw);
     const fz = Math.cos(rescuer.yaw);
     // Keep the orbit pivot at the eyes; OrbitControls handles look + zoom around it.
@@ -702,6 +710,9 @@ function stepRescuer(dt) {
     right: keysDown.has('d') || keysDown.has('arrowright'),
     jump: jumpEdge,
     interact: interactEdge,
+    // Shift or Z — hold to crouch, release to stand. (Ctrl steals Ctrl+W/A/S/D in the browser.)
+    // C remains Collapse.
+    crouch: keysDown.has('shift') || keysDown.has('z'),
     camForward: basis.forward,
     camRight: basis.right,
     loadkN: params.rescuerLoad,
@@ -716,7 +727,14 @@ function stepRescuer(dt) {
   for (const e of rescuer.drainEvents()) {
     if (e.type === 'VICTIM_ACCESSED') {
       victimsAccessed++;
-      setStatus(`✓ VICTIM_ACCESSED — reached survivor without collapsing their void (${victimsAccessed})`);
+      const score = victimsAccessed - rescuerCompromised;
+      setStatus(`✓ victim reached (+1) — score ${score} (${victimsAccessed} reached, ${rescuerCompromised} ops-compromised)`);
+    } else if (e.type === 'INGRESS_UNLOCKED') {
+      setStatus('entered cut opening — search the pocket for the survivor');
+    } else if (e.type === 'HOLE_SLIDE') {
+      setStatus('dropping through clear opening — crouch (Shift/Z) if the void is low');
+    } else if (e.type === 'RESCUER_CROUCH_BLOCKED') {
+      setStatus('cannot stand — overhead too low (stay crouched or crawl clear)');
     } else if (e.type === 'RESCUER_BUMP') {
       ensureAudio();
       playBodyBump();
@@ -724,7 +742,9 @@ function stepRescuer(dt) {
       if (!e.ok) {
         setStatus(e.reason === 'too_steep'
           ? 'landing too steep (>30°) — slid back'
-          : 'landing too high (>1 m) — slid back');
+          : e.reason === 'too_deep'
+            ? 'drop too deep (>2.5 m) — need rappel (TODO) — slid back'
+            : 'landing too high (>1 m) — slid back');
       }
     } else if (e.type === 'RESCUER_GRAB_FAIL') {
       setStatus('edge too steep to hold (>30°) — slipped');
@@ -782,16 +802,17 @@ function updateLoadPanel() {
     rows.push('<h4>Ladders</h4>');
     rows.push(`<div class="row"><span>placed</span><span>${ops.ladders.length}</span></div>`);
   }
-  if (voidMarkers.length) {
-    rows.push('<h4>Voids</h4>');
-    const cls = compromised > 0 ? 'bad' : 'ok';
-    rows.push(`<div class="row"><span>detected</span><span>${voidMarkers.length}</span></div>`);
-    rows.push(`<div class="row"><span>compromised</span><span class="${cls}">${compromised}</span></div>`);
-  }
-  if (rescuer) {
-    rows.push('<h4>USAR</h4>');
-    rows.push(`<div class="row"><span>rescuer</span><span class="ok">${params.rescuerMode ? 'CONTROL' : 'idle'}</span></div>`);
-    rows.push(`<div class="row"><span>victims accessed</span><span class="ok">${victimsAccessed}</span></div>`);
+  if (rescuer || victimsAccessed > 0 || rescuerCompromised > 0 || voidsList.length) {
+    const score = victimsAccessed - rescuerCompromised;
+    const scoreCls = score > 0 ? 'ok' : score < 0 ? 'bad' : '';
+    rows.push('<h4>USAR score</h4>');
+    rows.push(`<div class="row"><span>score</span><span class="${scoreCls}">${score}</span></div>`);
+    rows.push(`<div class="row"><span>victims reached</span><span class="ok">+${victimsAccessed}</span></div>`);
+    const cCls = rescuerCompromised > 0 ? 'bad' : 'ok';
+    rows.push(`<div class="row"><span>compromised by ops</span><span class="${cCls}">−${rescuerCompromised}</span></div>`);
+    if (rescuer) {
+      rows.push(`<div class="row"><span>rescuer</span><span class="ok">${params.rescuerMode ? 'CONTROL' : 'idle'}</span></div>`);
+    }
   }
   loadsEl.innerHTML = rows.join('');
 }
@@ -800,14 +821,14 @@ function rebuild() {
   // Clear the agent WHILE the Rapier world is still alive — disposing the world first
   // left removeCollider/removeRigidBody pointing at freed WASM memory and crashed rebuild.
   clearRescuer();
-  clearMarkers();
+  clearVoids();
   resetDust();
   clearSplinters();
   for (const [, mesh] of bagMeshes) { structureGroup.remove(mesh); disposeMesh(mesh); }
   bagMeshes.clear();
   for (const [, mesh] of ladderMeshes) { structureGroup.remove(mesh); disposeMesh(mesh); }
   ladderMeshes.clear();
-  compromised = 0; voidEvents.length = 0;
+  compromised = 0; rescuerCompromised = 0; voidEvents.length = 0;
   freezeQueued = false;
   if (sim) sim.dispose();
   sim = new RubbleSim(RAPIER, params, { onAdd, onRemove, onReshape, onExpose, onRebarChange, onSplinter });
@@ -843,38 +864,17 @@ function applyFreeze() {
   sim.freeze();
   syncMeshes();
   const voids = sim.detectVoids();
-  clearMarkers();
-  // Void markers are a *hint* only: a very faint spherical wireframe grid so debris stays
-  // readable. Intrusion / compromise still use the AABB from userData.void (radius × height),
-  // not the sphere mesh. Toggle with V / showVoidMarkers.
+  clearVoids();
+  // Voids are invisible search targets: victims sit on the pocket floor; intrusion still
+  // uses the AABB (radius × height around centre y). No wireframe markers — the rescuer
+  // finds survivors by cutting in and entering (telescopic probe camera is a later TODO).
   for (const v of voids) {
-    // Bounding sphere that covers the detected pocket (horizontal radius × vertical half-height).
-    const r = Math.max(v.radius, v.height / 2);
-    // Low segment counts → coarse latitude/longitude grid, not a dense ball of lines.
-    const sphereGeo = new THREE.SphereGeometry(r, 10, 6);
-    const m = new THREE.LineSegments(
-      new THREE.WireframeGeometry(sphereGeo),
-      new THREE.LineBasicMaterial({
-        color: 0x4fd6ff,
-        transparent: true,
-        opacity: 0.07,          // barely-there presence
-        depthWrite: false,
-        depthTest: false,       // still a hint through rubble without a solid fill
-      }),
-    );
-    sphereGeo.dispose();        // WireframeGeometry copies the positions; free the source
-    m.renderOrder = 990;
-    m.position.set(v.x, v.y, v.z);
-    m.visible = params.showVoidMarkers;
-    m.userData.void = v;
-    m.userData.compromised = false;
-    m.layers.set(LAYER_VOID);   // never pickable by a tool
-    markerGroup.add(m); voidMarkers.push(m);
+    voidsList.push({ ...v, compromised: false });
   }
   compromised = 0;
   phase = 'frozen';
   updateStressMap();
-  // Place prone victim figures at void centres (targets for VICTIM_ACCESSED).
+  // Place prone victim figures on confined void floors only (need tools to reach).
   spawnVictimMeshes();
   // Equilibrium census of the frozen pile: pieces the physics says should still be moving, and
   // pieces whose only load path is a rebar tie (those are the ones that read as "floating").
@@ -882,18 +882,27 @@ function applyFreeze() {
   const eqNote = eq
     ? ` • ${eq.failing} unstable, ${eq.hanging} on rebar`
     : '';
-  setStatus(`frozen • ${sim.parts.length} pieces • ${sim.stats.cracks} cracks • ${sim.stats.snaps} snaps • ${sim.stats.cuts} cuts • ${voids.length} voids${eqNote} — press R to spawn rescuer`);
+  const confined = voids.filter((v) => v.confined).length;
+  const victimNote = confined === 0
+    ? ' • no trapped survivors this seed — regenerate (P)'
+    : ` • ${Math.min(confined, 8)} trapped survivors`;
+  setStatus(`frozen • ${sim.parts.length} pieces • ${sim.stats.cracks} cracks • ${sim.stats.snaps} snaps • ${sim.stats.cuts} cuts • ${voids.length} voids · ${confined} confined${eqNote}${victimNote} — press R to spawn rescuer`);
 }
+
+/** Half torso thickness of the prone victim mesh — sit them on the pocket floor. */
+const VICTIM_FLOOR_OFFSET = 0.07;
 
 function spawnVictimMeshes() {
   for (const m of victimMeshes) { agentsGroup.remove(m); disposeRescuerMesh(m); }
   victimMeshes.length = 0;
-  const maxV = Math.min(voidMarkers.length, 8);
+  // Only confined pockets get survivors — open/walkable voids stay for intrusion only.
+  const confined = voidsList.filter((v) => v.confined);
+  const maxV = Math.min(confined.length, 8);
   for (let i = 0; i < maxV; i++) {
-    const marker = voidMarkers[i];
-    const v = marker.userData.void;
+    const v = confined[i];
     const mesh = createVictimMesh();
-    mesh.position.set(v.x, v.y, v.z);
+    const floorY = (v.floorY != null ? v.floorY : v.y - v.height / 2) + VICTIM_FLOOR_OFFSET;
+    mesh.position.set(v.x, floorY, v.z);
     mesh.userData.voidRef = v;
     agentsGroup.add(mesh);
     victimMeshes.push(mesh);
@@ -908,12 +917,13 @@ function spawnVictimMeshes() {
 // --- specs.md §4C: SURVIVOR_COMPROMISED ------------------------------------------------------
 // If debris shifts into a detected void, the survivable space is gone. Tested as an AABB overlap
 // against the part's half-extents (ignoring its rotation, so it errs on the side of warning).
+// Score −1 only when compromiseAttribution is set (a rescue tool woke the pile).
 let compromised = 0;
 function checkVoidIntrusion() {
   if (!sim) return;
-  for (const marker of voidMarkers) {
-    if (marker.userData.compromised) continue;
-    const v = marker.userData.void;
+  for (const entry of voidsList) {
+    if (entry.compromised) continue;
+    const v = entry;
     for (const part of sim.parts) {
       // Rescuers, victims, ladders, and shores must not alone fire SURVIVOR_COMPROMISED —
       // only debris intrusion destroys the pocket.
@@ -922,18 +932,21 @@ function checkVoidIntrusion() {
       if (Math.abs(t.x - v.x) < v.radius + s.hx &&
           Math.abs(t.z - v.z) < v.radius + s.hz &&
           Math.abs(t.y - v.y) < v.height / 2 + s.hy) {
-        marker.userData.compromised = true;
-        // Compromised voids stay faint but turn red so the count in the loads panel
-        // matches a subtle on-scene cue without re-blocking the debris view.
-        marker.material.color.set(0xff3344);
-        marker.material.opacity = 0.14;
+        entry.compromised = true;
         compromised++;
-        voidEvents.push({ type: 'SURVIVOR_COMPROMISED', x: v.x, y: v.y, z: v.z, by: part.kind });
+        const opsCaused = !!sim.compromiseAttribution;
+        if (opsCaused) rescuerCompromised++;
+        voidEvents.push({
+          type: 'SURVIVOR_COMPROMISED',
+          x: v.x, y: v.y, z: v.z, by: part.kind,
+          scored: opsCaused,
+        });
         if (rescuer) rescuer.markVoidCompromised(v);
         // Paint matching victim red if present.
         for (let i = 0; i < victimMeshes.length; i++) {
           const vm = victimMeshes[i];
-          if (Math.hypot(vm.position.x - v.x, vm.position.y - v.y, vm.position.z - v.z) < 0.2) {
+          if (vm.userData.voidRef === v ||
+              Math.hypot(vm.position.x - v.x, vm.position.z - v.z) < 0.35) {
             vm.traverse((o) => {
               if (o.isMesh) {
                 o.material = o.material.clone();
@@ -942,8 +955,14 @@ function checkVoidIntrusion() {
             });
           }
         }
-        setStatus(`⚠ SURVIVOR_COMPROMISED — ${part.kind} shifted into the void at ` +
-          `(${v.x.toFixed(1)}, ${v.y.toFixed(1)}, ${v.z.toFixed(1)})`);
+        if (opsCaused) {
+          const score = victimsAccessed - rescuerCompromised;
+          setStatus(`⚠ survivor compromised by ops (−1) — score ${score} · ${part.kind} into void at ` +
+            `(${v.x.toFixed(1)}, ${v.y.toFixed(1)}, ${v.z.toFixed(1)})`);
+        } else {
+          setStatus(`⚠ void crushed (no score — not from rescue tools) at ` +
+            `(${v.x.toFixed(1)}, ${v.y.toFixed(1)}, ${v.z.toFixed(1)})`);
+        }
         break;
       }
     }
@@ -1779,7 +1798,9 @@ fT.add(params, 'standSeconds', 0, 5, 0.2);
 fT.add(params, 'settleSeconds', 3, 15, 0.5);
 fT.add(params, 'cutSettleSeconds', 1, 8, 0.5).name('cut re-settle secs');
 fT.add(params, 'minVoidHeight', 0.3, 1.5, 0.05);
-fT.add(params, 'showVoidMarkers').onChange((v) => voidMarkers.forEach((m) => (m.visible = v)));
+fT.add(params, 'voidConfineRadius', 0.5, 2.0, 0.1).name('confine radius (m)');
+fT.add(params, 'voidConfineMinHits', 4, 8, 1).name('confine min side hits');
+fT.add(params, 'voidRooftopMaxClear', 0.1, 1.0, 0.05).name('rooftop reject (m)');
 const fEq = gui.addFolder('Equipment');
 // Held in a module-level `let` (declared with the tool state) so refreshEquipmentGate can grey the
 // dropdown out while there is no rescuer to carry anything.
@@ -1822,8 +1843,15 @@ addEventListener('keydown', (e) => {
   const k = e.key.toLowerCase();
   // Track movement keys even when typing isn't the focus — rescuer mode needs them.
   keysDown.add(k);
+  // Mirror Shift for hold-to-crouch (e.shiftKey survives lost keyups better than key alone).
+  if (e.code === 'ShiftLeft' || e.code === 'ShiftRight' || e.key === 'Shift') {
+    keysDown.add('shift');
+  }
+  if (!e.shiftKey) keysDown.delete('shift');
   if (!e.repeat && (k === ' ' || k === 'spacebar')) { jumpEdge = true; e.preventDefault(); }
   if (!e.repeat && k === 'e' && params.rescuerMode) { interactEdge = true; e.preventDefault(); return; }
+  // Keep Shift/Z from scrolling / finding-in-page while rescuer is in control.
+  if (params.rescuerMode && (k === 'shift' || e.key === 'Shift' || k === 'z')) e.preventDefault();
 
   if (k === 'p') rebuild();
   else if (k === 'c') doCollapse();
@@ -1846,14 +1874,13 @@ addEventListener('keydown', (e) => {
     }
   }
   else if (k === 't' && params.rescuerMode && rescuer) {
-    // Toggle third-person shoulder ↔ first-person eyes (V is already void markers).
+    // Toggle third-person shoulder ↔ first-person eyes.
     params.rescuerView = params.rescuerView === 'first' ? 'third' : 'first';
     applyRescuerViewMode();
     setStatus(params.rescuerView === 'first'
       ? '1st-person eyes — drag look · scroll zoom'
       : '3rd-person shoulder — drag orbit · scroll zoom · pan');
   }
-  else if (k === 'v') { params.showVoidMarkers = !params.showVoidMarkers; voidMarkers.forEach((m) => (m.visible = params.showVoidMarkers)); }
   else if (k === 's' && !params.rescuerMode) {
     params.showStress = !params.showStress; updateStressMap();
     setStatus(`stress map ${params.showStress ? 'ON — grey→red is utilization / contact load' : 'off'}`);
@@ -1869,7 +1896,17 @@ addEventListener('keydown', (e) => {
     if (tool) setEquipment(tool.label);
   }
 });
-addEventListener('keyup', (e) => { keysDown.delete(e.key.toLowerCase()); });
+addEventListener('keyup', (e) => {
+  const k = e.key.toLowerCase();
+  keysDown.delete(k);
+  if (e.code === 'ShiftLeft' || e.code === 'ShiftRight' || e.key === 'Shift' || k === 'shift') {
+    keysDown.delete('shift');
+  }
+  if (!e.shiftKey) keysDown.delete('shift');
+});
+// Focus loss often drops keyup for modifiers — never leave crouch latched.
+addEventListener('blur', () => { keysDown.delete('shift'); keysDown.delete('z'); });
+window.addEventListener('blur', () => { keysDown.delete('shift'); keysDown.delete('z'); });
 
 // ---------------------------------------------------------------------------
 // Main loop
@@ -1958,8 +1995,10 @@ if (location.search.includes('test')) {
     // structural / rescue state for the newer features
     frameReport: () => (sim.frame ? sim.frame.report() : null),
     rescueReport: () => (sim.rescue ? sim.rescue.report() : null),
-    voids: () => voidMarkers.map((m) => m.userData.void),
+    voids: () => voidsList.slice(),
     compromised: () => compromised,
+    rescuerCompromised: () => rescuerCompromised,
+    score: () => victimsAccessed - rescuerCompromised,
     rescuer: () => rescuer,
     spawnRescuer,
     // Park the rescuer at a work face. `snap` false keeps the exact pose, which is what a reach

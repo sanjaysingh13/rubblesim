@@ -798,6 +798,39 @@ hammered opening — are removed from the parent mesh and spawned as dynamic deb
 (`_dropLooseRebar` / `_spawnRebarDebris`). Snip gap breaks lattice adjacency so stubs across
 a cut do not stay welded. `verify-rebar-fall.mjs` covers this.
 
+**Victim placement + USAR score (2026-08-02).**
+
+- **No floating victims:** `detectVoids` stores `floorY`; prone figures sit on the pocket floor
+  (`floorY + 0.07`), not at the void midpoint.
+- **No void wireframes:** cyan sphere markers / `V` toggle removed. Voids remain as invisible
+  AABB targets for spawn + intrusion. HUD shows **USAR score** instead of void counts.
+- **+1 reach:** rescuer must pass through a registered cutter hole or through hammer breach
+  (`sim.openings` / `openingIngressAt`), unlocking nearby victims, then get within
+  `ACCESS_RADIUS`. Proximity alone no longer scores.
+- **−1 ops-compromise:** `sim.compromiseAttribution` is set when a rescue tool wakes debris.
+  Later `SURVIVOR_COMPROMISED` events increment `rescuerCompromised` (and the score); pre-tool
+  crush still paints the victim lost but does not change score.
+- **Hole drop ≤ 2.5 m:** `_resolveJumpLanding` rejects drops deeper than `MAX_HOLE_DROP`
+  (`too_deep`).
+
+**TODO — rappelling** for voids deeper than 2.5 m.
+
+**TODO — telescopic camera** the rescuer can drop into a void to probe when the pocket is not
+fully visible from outside.
+
+**Confined victims only (2026-08-02).** Open / walkable voids still detect for compromise AABBs,
+but survivors spawn only in **confined** pockets: ≥6/8 lateral solid hits within 1 m at torso
+height, and not an exposed rooftop deck (`voidRooftopMaxClear`). Status reports
+`N voids · M confined` and refuses to place walk-up victims. Ingress scoring unchanged.
+
+**Hole slide + crouch (2026-08-02).** Stepping onto a **passable** opening (concrete-cutter hole,
+or hammer through-breach with spanning rebar cleared) slides the rescuer down (`HOLE_SLIDE`,
+still capped at 2.5 m). Hold **Shift** or **Z** to crouch: capsule shrinks to ~0.88 m
+(`CROUCH_HALF` / `CROUCH_RADIUS`) so he can crawl into low voids; crawl speed ~0.95 m/s.
+Standing blocked under low overhead emits `RESCUER_CROUCH_BLOCKED`. (Ctrl was dropped — it
+steals Ctrl+W/A/S/D from the browser.) Human scale is correct
+(~1.68 m vs 2.6 m stories); they look large vs 0.6 m cutter holes by design.
+
 **Next — expand reach gating to the remaining tools one at a time** (torch, bag, shore;
 ladder already mounts via `E`). Flip `needsReach: true` and harden each tool's eligibility.
 

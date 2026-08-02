@@ -5,7 +5,7 @@ import RAPIER from '@dimforge/rapier3d-compat';
 import { RubbleSim } from './src/sim.js';
 import {
   RescuerAgent, mantleRiseOk, agentTriggersCompromise, slopeOk,
-  MANTLE_MIN, MANTLE_MAX, ACCESS_RADIUS, MAX_JUMP_LAND_H, MAX_GRAB_H,
+  MANTLE_MIN, MANTLE_MAX, ACCESS_RADIUS, MAX_JUMP_LAND_H, MAX_HOLE_DROP, MAX_GRAB_H,
   JUMP_SPEED, GRAVITY,
 } from './src/rescuer.js';
 import { CAPSULE_HALF, CAPSULE_RADIUS } from './src/rescuer-constants.js';
@@ -25,6 +25,7 @@ assert(slopeOk(0, 1, 0), 'flat floor slope OK');
 assert(slopeOk(0, Math.cos(25 * Math.PI / 180), Math.sin(25 * Math.PI / 180)), '25° incline OK');
 assert(!slopeOk(0, Math.cos(40 * Math.PI / 180), Math.sin(40 * Math.PI / 180)), '40° incline rejected');
 assert(MAX_JUMP_LAND_H === 1.0, 'jump land height cap is 1 m');
+assert(MAX_HOLE_DROP === 2.5, 'hole drop cap is 2.5 m (rappel for deeper)');
 assert(!agentTriggersCompromise({ agent: true }), 'agent-tagged part must not trigger compromise');
 assert(!agentTriggersCompromise({ rescuer: true }), 'rescuer-tagged part must not trigger compromise');
 assert(!agentTriggersCompromise({ victim: true }), 'victim-tagged part must not trigger compromise');
@@ -117,6 +118,34 @@ assert(yAfter > yBefore + 0.4, `ladder climb raised agent ${(yAfter - yBefore).t
 
 // ---- agent overlapping a void AABB does NOT count as compromise ------------
 const voids = sim.detectVoids();
+if (voids.length) {
+  assert(voids[0].floorY != null, 'detectVoids stores floorY for victim placement');
+  assert(voids[0].floorY <= voids[0].y + 1e-6, 'floorY is at or below void centre');
+  assert(typeof voids[0].confined === 'boolean', 'each void is marked confined or open');
+}
+assert(typeof sim.confinedVoids === 'function', 'confinedVoids() helper exists');
+assert(
+  sim.confinedVoids().every((v) => v.confined),
+  'confinedVoids returns only confined pockets',
+);
+
+// ---- confine heuristic: open deck fails; walled pocket passes --------------------
+{
+  const deck = { x: 0, y: 0.6, z: 0, height: 1.2, floorY: 0.1, radius: 0.5 };
+  // Open deck: no solids anywhere → rooftop reject (localTop stays at floorY).
+  const openSolid = () => false;
+  assert(!sim._isVoidConfined(deck, openSolid), 'open deck with no solids is not confined');
+
+  // Walled pocket: solids on all 8 lateral spokes + a roof well above the floor.
+  const walledSolid = (x, y, z) => {
+    const dx = x - deck.x, dz = z - deck.z;
+    const r = Math.hypot(dx, dz);
+    if (y >= deck.floorY + 1.5 && r < 0.3) return true; // roof above pocket centre
+    if (Math.abs(y - (deck.floorY + 0.45)) < 0.2 && r >= 0.4 && r <= 1.05) return true; // ring wall
+    return false;
+  };
+  assert(sim._isVoidConfined(deck, walledSolid), 'pocket with 8-sided walls + roof is confined');
+}
 let agentWouldCompromise = false;
 if (voids.length && agent.part) {
   // Place agent inside first void and run the same AABB test as main.js, with exclusions.
@@ -134,6 +163,27 @@ assert(!agentWouldCompromise, 'rescuer inside a void AABB does not alone fire SU
 
 // Victim access distance constant is sane.
 assert(ACCESS_RADIUS > 0.3 && ACCESS_RADIUS < 1.5, `ACCESS_RADIUS=${ACCESS_RADIUS} m is a touch range`);
+
+// ---- ingress gate: proximity alone must NOT score; unlock then proximity does ----------
+{
+  const voidRef = { x: 1, y: 1.2, z: 0, radius: 0.6, height: 1.2, floorY: 0.6 };
+  const vy = voidRef.floorY + 0.07;
+  agent.setVictims([{ id: 'v0', x: voidRef.x, y: vy, z: voidRef.z, voidRef }]);
+  agent.accessed.clear();
+  agent.drainEvents();
+  agent._setPose({
+    x: voidRef.x,
+    y: vy + CAPSULE_HALF + CAPSULE_RADIUS,
+    z: voidRef.z,
+  });
+  agent._checkVictimAccess();
+  assert(agent.accessedCount() === 0, 'proximity without hole ingress does not score');
+  agent.unlockVictimIngress('v0');
+  agent._checkVictimAccess();
+  assert(agent.accessedCount() === 1, 'ingress unlock + proximity scores VICTIM_ACCESSED');
+  const accessedEv = agent.drainEvents().filter((e) => e.type === 'VICTIM_ACCESSED');
+  assert(accessedEv.length === 1, 'emits exactly one VICTIM_ACCESSED after ingress');
+}
 
 // ---- frozen-world solid collision (no world.step between moves) -------------
 // Soft freeze skips world.step(); without query-pipeline sync the KCC ghosts through

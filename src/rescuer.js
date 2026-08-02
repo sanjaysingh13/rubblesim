@@ -20,9 +20,10 @@
 // (and a multiple during mantle). Post-collapse, waking debris underfoot is what actually
 // stresses the rubble contact graph.
 
-import { CAPSULE_RADIUS, CAPSULE_HALF, RESCUER_MASS_T } from './rescuer-constants.js';
+import { CAPSULE_RADIUS, CAPSULE_HALF, CROUCH_RADIUS, CROUCH_HALF, RESCUER_MASS_T } from './rescuer-constants.js';
 
 export const WALK_SPEED = 2.2;          // m/s on rubble
+export const CRAWL_SPEED = 0.95;        // m/s while crouched
 export const JUMP_SPEED = 5.2;          // m/s — enough apex to reach ledges / 1 m landings
 export const GRAVITY = 18;              // m/s² — slightly juicy for game feel on kinematic body
 export const ACCESS_RADIUS = 0.6;       // m — touch distance to count VICTIM_ACCESSED
@@ -31,10 +32,12 @@ export const ACCESS_RADIUS = 0.6;       // m — touch distance to count VICTIM_
 export const MAX_SLOPE_DEG = 30;        // walk / land / grab — steeper → slide
 export const MAX_SLOPE_RAD = (MAX_SLOPE_DEG * Math.PI) / 180;
 export const MAX_JUMP_LAND_H = 1.0;     // m — jump may only land on surfaces ≤ this above takeoff
+export const MAX_HOLE_DROP = 2.5;       // m — free drop into a hole; deeper needs rappel (TODO)
 export const MAX_GRAB_H = 7.0;          // m — max edge height above jump origin for a pull-up grab
 export const MIN_GRAB_H = 1.2;          // m — below this, use walk/autostep or a short land, not a mantle
 export const HAND_REACH = 2.15;         // m above feet — raised-hand height while jumping
 export const LAND_FORWARD = 0.12;       // m — plant a few cm in front of the contact
+export const HOLE_SLIDE_SPEED = -4.5;   // m/s commit fall through a clear opening (was too soft → snap fight)
 
 export const MANTLE_MIN = MIN_GRAB_H;
 export const MANTLE_MAX = MAX_GRAB_H;
@@ -75,8 +78,13 @@ export class RescuerAgent {
     this.wakeCooldown = 0;
     this.mantle = null;          // { t, duration, from, to, supportPart }
     this.ladderRide = null;      // { ladder, t }  t ∈ [0,1] along length
-    this.victims = [];           // { id, x, y, z, voidRef, mesh?, lost }
+    this.victims = [];           // { id, x, y, z, voidRef, lost, ingressUnlocked }
     this.jumpOrigin = null;      // { x, y, z, feetY } when Space starts a jump
+    this.crouched = false;       // hold Shift/Z — shorter capsule for crawl
+    this.capHalf = CAPSULE_HALF;
+    this.capRadius = CAPSULE_RADIUS;
+    this.holeSlideCooldown = 0;   // avoid re-triggering fall while climbing out
+    this.holeSliding = false;    // true while committed through an opening (snap/autostep off)
     // wasGrounded starts false until the first KCC query latches — avoids a phantom Space
     // jump or gravity freefall on the very first frame before queries are synced.
     this.wasGrounded = false;
@@ -92,29 +100,8 @@ export class RescuerAgent {
     this.body = sim.world.createRigidBody(bd);
 
     // Capsule: radius + cylindrical half-height. Total standing height = 2*(half+radius).
-    const cd = R.ColliderDesc.capsule(CAPSULE_HALF, CAPSULE_RADIUS)
-      .setFriction(0.9)
-      .setRestitution(0)
-      .setDensity(0);            // kinematic — mass doesn't drive motion; load is applied separately
-    this.collider = sim.world.createCollider(cd, this.body);
-
-    // Register as a tagged "part" so collision lookups can skip us for void intrusion, but we
-    // are NOT pushed into sim.parts (would break freeze / stress iteration assumptions).
-    this.part = {
-      body: this.body,
-      col: this.collider,
-      colliders: [this.collider],
-      shape: { hx: CAPSULE_RADIUS, hy: CAPSULE_HALF + CAPSULE_RADIUS, hz: CAPSULE_RADIUS },
-      kind: 'rescuer',
-      matKind: 'rescuer',
-      agent: true,
-      rescuer: true,
-      dead: false,
-      fixed: false,
-    };
-    sim.colliderToPart.set(this.collider.handle, this.part);
-
     this.controller = sim.world.createCharacterController(0.01);
+    this._buildCapsuleCollider(CAPSULE_HALF, CAPSULE_RADIUS);
     // DEVLOG: max vertical incline 30° — steeper surfaces are walls / slide-backs.
     this.controller.setMaxSlopeClimbAngle(MAX_SLOPE_RAD);
     this.controller.setMinSlopeSlideAngle(MAX_SLOPE_RAD);
@@ -137,6 +124,52 @@ export class RescuerAgent {
     this.emit({ type: 'RESCUER_SPAWNED', x: spawn.x, y: spawn.y, z: spawn.z });
   }
 
+  /**
+   * Create or replace the KCC capsule. Keeps feet planted when switching stand ↔ crouch
+   * by adjusting the body centre for the new half+radius.
+   */
+  _buildCapsuleCollider(half, radius) {
+    const R = this.sim.R;
+    const feet = this.body ? this.feetY() : null;
+    if (this.collider && this.sim?.world) {
+      try {
+        this.sim.colliderToPart.delete(this.collider.handle);
+        this.sim.world.removeCollider(this.collider, true);
+      } catch (_) { /* rebuild / dispose race */ }
+      this.collider = null;
+    }
+    this.capHalf = half;
+    this.capRadius = radius;
+    const cd = R.ColliderDesc.capsule(half, radius)
+      .setFriction(0.9)
+      .setRestitution(0)
+      .setDensity(0);
+    this.collider = this.sim.world.createCollider(cd, this.body);
+    if (!this.part) {
+      this.part = {
+        body: this.body,
+        col: this.collider,
+        colliders: [this.collider],
+        shape: { hx: radius, hy: half + radius, hz: radius },
+        kind: 'rescuer',
+        matKind: 'rescuer',
+        agent: true,
+        rescuer: true,
+        dead: false,
+        fixed: false,
+      };
+    } else {
+      this.part.col = this.collider;
+      this.part.colliders = [this.collider];
+      this.part.shape = { hx: radius, hy: half + radius, hz: radius };
+    }
+    this.sim.colliderToPart.set(this.collider.handle, this.part);
+    if (feet != null) {
+      this._setPose({ x: this.translation().x, y: feet + half + radius, z: this.translation().z });
+    }
+    this._syncSceneQueries();
+  }
+
   emit(e) { this.events.push(e); return e; }
   drainEvents() { const e = this.events.slice(); this.events.length = 0; return e; }
 
@@ -145,7 +178,12 @@ export class RescuerAgent {
   /** Feet world Y (bottom of capsule). */
   feetY() {
     const t = this.translation();
-    return t.y - CAPSULE_HALF - CAPSULE_RADIUS;
+    return t.y - this.capHalf - this.capRadius;
+  }
+
+  /** Standing height of the current capsule (m). */
+  capsuleHeight() {
+    return this.capHalf * 2 + this.capRadius * 2;
   }
 
   /**
@@ -154,7 +192,115 @@ export class RescuerAgent {
    */
   stance() {
     const t = this.translation();
-    return { x: t.x, z: t.z, feetY: this.feetY(), yaw: this.yaw };
+    return {
+      x: t.x, z: t.z, feetY: this.feetY(), yaw: this.yaw,
+      crouched: this.crouched, height: this.capsuleHeight(),
+    };
+  }
+
+  /**
+   * Hold-to-crouch. Standing up requires clear overhead; otherwise stay crouched.
+   */
+  setCrouch(want) {
+    if (want === this.crouched) return;
+    if (want) {
+      this._buildCapsuleCollider(CROUCH_HALF, CROUCH_RADIUS);
+      this.crouched = true;
+      this.emit({ type: 'RESCUER_CROUCH', crouched: true });
+      return;
+    }
+    // Stand: cast up from feet for standing clearance.
+    if (!this._canStandHere()) {
+      this.emit({ type: 'RESCUER_CROUCH_BLOCKED' });
+      return;
+    }
+    this._buildCapsuleCollider(CAPSULE_HALF, CAPSULE_RADIUS);
+    this.crouched = false;
+    this.emit({ type: 'RESCUER_CROUCH', crouched: false });
+  }
+
+  /** True if a standing capsule fits above the current feet without hitting solid. */
+  _canStandHere() {
+    const feet = this.feetY();
+    const t = this.translation();
+    const standTop = feet + CAPSULE_HALF * 2 + CAPSULE_RADIUS * 2;
+    // Start above the crouch crown + probe radius so we never overlap our own capsule.
+    const probeR = Math.min(CROUCH_RADIUS, CAPSULE_RADIUS) * 0.7;
+    const crouchTop = feet + this.capsuleHeight();
+    const R = this.sim.R;
+    const ball = new R.Ball(probeR);
+    const rot = { x: 0, y: 0, z: 0, w: 1 };
+    for (let y = crouchTop + probeR + 0.04; y <= standTop - probeR; y += 0.1) {
+      // Exclude our own body — otherwise the crouch capsule always "blocks" standing.
+      const hit = this.sim.world.intersectionWithShape(
+        { x: t.x, y, z: t.z }, rot, ball,
+        undefined, undefined, undefined, this.body,
+      );
+      if (hit !== null) return false;
+    }
+    return true;
+  }
+
+  /**
+   * Snap-to-ground + autostep fight a hole drop: the capsule falls a few cm into the
+   * opening, then snaps back onto the frame rim → visible up/down oscillation.
+   * While committed through a hole, both must stay off until we land below.
+   */
+  _setHoleFallAids(active) {
+    if (!this.controller) return;
+    if (active) {
+      // Distance 0 = effectively off (rapier-compat has no disableSnapToGround).
+      this.controller.enableSnapToGround(0);
+      this.controller.enableAutostep(0, 0, false);
+    } else {
+      this.controller.enableSnapToGround(0.35);
+      this.controller.enableAutostep(0.45, 0.2, true);
+    }
+  }
+
+  /**
+   * Stepped onto a clear cutter / hammer+rebar opening — drop through instead of walking over.
+   * Teleports below the slab band in one shot so KCC never gets a chance to snap back to the rim.
+   */
+  _tryHoleSlide(grounded) {
+    if (this.holeSliding) return false;
+    if (!grounded || this.mode === 'jump' || this.mode === 'mantle' || this.mode === 'ladder') return false;
+    if (this.holeSlideCooldown > 0) return false;
+    if (!this.sim?.passableOpeningAt) return false;
+    const t = this.translation();
+    const feet = this.feetY();
+    // Stricter inset so only a real step into the hole commits (rim walking stays stable).
+    const hit = this.sim.passableOpeningAt(t.x, feet + 0.05, t.z, 0.72);
+    if (!hit) return false;
+
+    const hy = hit.part?.shape?.hy ?? 0.11;
+    // Capsule centre clearly under the slab underside — past snap range and past frame colliders.
+    const clearFeetY = hit.y - hy - 0.28;
+    const centreY = clearFeetY + this.capHalf + this.capRadius;
+
+    this.jumpOrigin = { x: t.x, y: t.y, z: t.z, feetY: feet };
+    this._setHoleFallAids(true);
+    this.holeSliding = true;
+    this._setPose({
+      x: hit.x,
+      y: centreY,
+      z: hit.z,
+    });
+    this.vVel = HOLE_SLIDE_SPEED;
+    this.mode = 'jump';
+    this.wasGrounded = false;
+    this.locoReady = false;
+    // Long enough to finish the drop and step away from the hole column before re-arming.
+    this.holeSlideCooldown = 1.4;
+    this.emit({ type: 'HOLE_SLIDE', x: hit.x, y: hit.y, z: hit.z, radius: hit.radius });
+    return true;
+  }
+
+  /** End a committed hole fall and restore normal walk aids. */
+  _endHoleSlide() {
+    if (!this.holeSliding) return;
+    this.holeSliding = false;
+    this._setHoleFallAids(false);
   }
 
   /**
@@ -250,25 +396,34 @@ export class RescuerAgent {
 
   /**
    * Input snapshot from the renderer:
-   *   { forward, back, left, right, jump, interact, camForward:{x,z}, camRight:{x,z}, loadkN }
+   *   { forward, back, left, right, jump, interact, crouch, camForward, camRight, loadkN }
    */
   step(dt, input = {}) {
     if (!this.body) return;
     const loadkN = input.loadkN ?? this.sim.opts.rescuerLoad ?? 1.2;
     this.bumpCooldown = Math.max(0, this.bumpCooldown - dt);
+    this.holeSlideCooldown = Math.max(0, this.holeSlideCooldown - dt);
+
+    // Hold Shift or Z to crouch / crawl (C is Collapse; Ctrl fights browser shortcuts).
+    if (this.mode !== 'mantle' && this.mode !== 'ladder') {
+      this.setCrouch(!!input.crouch);
+    }
 
     if (this.mode === 'mantle') {
       this._stepMantle(dt, loadkN);
+      this._checkOpeningIngress();
       this._checkVictimAccess();
       return;
     }
     if (this.mode === 'ladder') {
       this._stepLadder(dt, input, loadkN);
+      this._checkOpeningIngress();
       this._checkVictimAccess();
       return;
     }
 
     // --- horizontal wish from camera-relative WASD --------------------------------
+    const speed = this.crouched ? CRAWL_SPEED : WALK_SPEED;
     let mx = 0, mz = 0;
     const f = input.camForward || { x: 0, z: 1 };
     const r = input.camRight || { x: 1, z: 0 };
@@ -278,11 +433,15 @@ export class RescuerAgent {
     if (input.left) { mx -= r.x; mz -= r.z; }
     const len = Math.hypot(mx, mz);
     if (len > 1e-6) {
-      mx = (mx / len) * WALK_SPEED * dt;
-      mz = (mz / len) * WALK_SPEED * dt;
-      this.walkPhase += dt * 8;
-      if (this.mode !== 'jump') this.mode = 'walk';
-    } else if (this.mode === 'walk') {
+      mx = (mx / len) * speed * dt;
+      mz = (mz / len) * speed * dt;
+      this.walkPhase += dt * (this.crouched ? 5 : 8);
+      if (this.mode !== 'jump') this.mode = this.crouched ? 'crawl' : 'walk';
+    } else if (this.mode === 'walk' || this.mode === 'crawl') {
+      this.mode = this.crouched ? 'crouch' : 'idle';
+    } else if (this.crouched && (this.mode === 'idle' || !this.mode)) {
+      this.mode = 'crouch';
+    } else if (!this.crouched && this.mode === 'crouch') {
       this.mode = 'idle';
     }
 
@@ -295,71 +454,80 @@ export class RescuerAgent {
     }
 
     // --- vertical: jump + gravity -------------------------------------------------
-    // computedGrounded() is stale until the first _moveWithKcc — treat as not ready.
     const groundedBefore = this.locoReady && this.controller.computedGrounded();
-    if (groundedBefore && this.mode === 'jump') {
+
+    // Over a passable cut: kill snap/autostep so the rim cannot bob the capsule, then commit.
+    if (!this.holeSliding && this.sim?.passableOpeningAt) {
+      const tProbe = this.translation();
+      const overCut = this.sim.passableOpeningAt(tProbe.x, this.feetY() + 0.05, tProbe.z, 0.88);
+      if (overCut) this._setHoleFallAids(true);
+      else this._setHoleFallAids(false);
+    }
+    this._tryHoleSlide(groundedBefore);
+
+    if (groundedBefore && this.mode === 'jump' && !this.holeSliding) {
       // Landing handled after movement — keep mode jump until we resolve the land.
     }
-    // Jump only after we have latched onto real ground once (prevents spawn auto-jump /
-    // freefall-as-jump when queries were stale).
-    if (this.locoReady && groundedBefore && input.jump && this.mode !== 'jump') {
+    // No jump while crouched — stand first. Hole-slide already set mode=jump.
+    if (this.locoReady && groundedBefore && input.jump && this.mode !== 'jump' && !this.crouched && !this.holeSliding) {
       const t0 = this.translation();
       this.jumpOrigin = { x: t0.x, y: t0.y, z: t0.z, feetY: this.feetY() };
       this.vVel = JUMP_SPEED;
       this.mode = 'jump';
       this.emit({ type: 'RESCUER_JUMP', feetY: this.jumpOrigin.feetY });
-    } else if (!groundedBefore) {
+    } else if (!groundedBefore || this.holeSliding) {
       this.vVel -= GRAVITY * dt;
       if (this.vVel < -12) this.vVel = -12;
     } else if (this.mode !== 'jump') {
       this.vVel = -0.08;
     }
 
-    // Desired delta includes our manual vertical velocity. KCC clips this against solids
-    // *only if* the query pipeline is current (see _syncSceneQueries).
     const desired = { x: mx, y: this.vVel * dt, z: mz };
     const { corr, grounded: groundedAfter } = this._moveWithKcc(desired);
 
-    // Face the move direction only when we actually travelled horizontally.
     if (len > 1e-6 && (Math.abs(corr.x) + Math.abs(corr.z)) > 1e-4) {
       this.yaw = Math.atan2(corr.x, corr.z);
     } else if (len > 1e-6) {
       this.yaw = Math.atan2(mx, mz);
     }
 
-    // Solid-body rule: KCC already stops penetration. If a horizontal wish was largely
-    // rejected by a near-vertical hit, fire a light body-bump (trunk/boot on concrete).
     this._detectBump(desired, corr);
 
     if (groundedAfter) this.locoReady = true;
 
-    // Mid-air: try to grab an edge within raised-hand reach (≤ MAX_GRAB_H above jump origin).
     if (this.mode === 'jump' && !groundedAfter) {
       const grab = this._findJumpGrab();
       if (grab) {
         this._startMantle(grab);
+        this._checkOpeningIngress();
         this._checkVictimAccess();
         return;
       }
     }
 
-    // Landing from a jump: enforce ≤1 m rise and ≤30° slope, else slide back.
     if (this.mode === 'jump' && !this.wasGrounded && groundedAfter) {
       this._resolveJumpLanding();
+      this._endHoleSlide();
     } else if (groundedAfter && this.mode === 'jump') {
-      this.mode = len > 1e-6 ? 'walk' : 'idle';
+      this.mode = len > 1e-6 ? (this.crouched ? 'crawl' : 'walk') : (this.crouched ? 'crouch' : 'idle');
       this.jumpOrigin = null;
+      this._endHoleSlide();
+    }
+
+    // Safety: if somehow grounded while still flagged, restore walk aids.
+    if (groundedAfter && this.holeSliding && this.mode !== 'jump') {
+      this._endHoleSlide();
     }
 
     this.wasGrounded = groundedAfter;
     this._updateLiveLoad(loadkN, groundedAfter);
     this._maybeWake(dt, len > 1e-6 || this.mode === 'jump');
 
-    // Interact (E): mantle when standing facing a ledge, else nearby ladder.
-    if (input.interact && this.mode !== 'jump') {
+    if (input.interact && this.mode !== 'jump' && !this.crouched) {
       if (!this._tryMantle()) this._tryMountLadder();
     }
 
+    this._checkOpeningIngress();
     this._checkVictimAccess();
   }
 
@@ -387,38 +555,46 @@ export class RescuerAgent {
   }
 
   /**
-   * After a jump touches down: accept only if rise ≤ 1 m and surface slope ≤ 30°.
+   * After a jump touches down: accept only if rise ≤ 1 m, drop ≤ MAX_HOLE_DROP, and
+   * surface slope ≤ 30°. Deeper drops need rappelling (TODO).
    */
   _resolveJumpLanding() {
     const origin = this.jumpOrigin;
     const feet = this.feetY();
     const rise = origin ? feet - origin.feetY : 0;
+    const drop = origin ? origin.feetY - feet : 0;
     const ground = this._sampleGroundNormal();
     const okSlope = ground ? slopeOk(ground.x, ground.y, ground.z) : true;
-    const okHeight = rise <= MAX_JUMP_LAND_H + 0.05;
+    const okRise = rise <= MAX_JUMP_LAND_H + 0.05;
+    const okDrop = drop <= MAX_HOLE_DROP + 0.05;
+    const okHeight = okRise && okDrop;
 
     if (okHeight && okSlope) {
-      // Plant a few cm forward along facing so the landing reads as a step-up.
-      const fx = Math.sin(this.yaw), fz = Math.cos(this.yaw);
-      const t = this.translation();
-      this._setPose({
-        x: t.x + fx * LAND_FORWARD,
-        y: t.y,
-        z: t.z + fz * LAND_FORWARD,
-      });
-      this.mode = 'idle';
+      // Hole drops plant in place — a forward nudge can push back onto the rim and re-bounce.
+      if (!this.holeSliding) {
+        const fx = Math.sin(this.yaw), fz = Math.cos(this.yaw);
+        const t = this.translation();
+        this._setPose({
+          x: t.x + fx * LAND_FORWARD,
+          y: t.y,
+          z: t.z + fz * LAND_FORWARD,
+        });
+      }
+      this.mode = this.crouched ? 'crouch' : 'idle';
       this.vVel = -0.08;
-      this.emit({ type: 'RESCUER_LAND', rise, ok: true });
+      this.emit({ type: 'RESCUER_LAND', rise, drop, ok: true });
       this.jumpOrigin = null;
       return;
     }
 
     // Reject: slide back toward the takeoff footprint.
+    const reason = !okDrop ? 'too_deep' : !okRise ? 'too_high' : 'too_steep';
     this.emit({
       type: 'RESCUER_LAND',
       rise,
+      drop,
       ok: false,
-      reason: !okHeight ? 'too_high' : 'too_steep',
+      reason,
     });
     if (origin) {
       const t = this.translation();
@@ -443,7 +619,7 @@ export class RescuerAgent {
     const hit = this._castRay(
       { x: t.x, y: t.y, z: t.z },
       { x: 0, y: -1, z: 0 },
-      CAPSULE_HALF + CAPSULE_RADIUS + 0.6,
+      this.capHalf + this.capRadius + 0.6,
       { normal: true },
     );
     if (!hit) return null;
@@ -529,8 +705,10 @@ export class RescuerAgent {
   }
 
   _startMantle(target) {
+    // Pull-ups need full standing height — leave crouch before climbing.
+    if (this.crouched) this.setCrouch(false);
     const t = this.translation();
-    const landY = target.topY + CAPSULE_HALF + CAPSULE_RADIUS + 0.02;
+    const landY = target.topY + this.capHalf + this.capRadius + 0.02;
     this.mantle = {
       t: 0,
       duration: MANTLE_DURATION,
@@ -770,6 +948,9 @@ export class RescuerAgent {
   /**
    * Register victim targets (usually one per void). Does not create physics bodies —
    * victims are sensors only; the renderer draws them.
+   *
+   * `ingressUnlocked` starts false: the rescuer must pass through a cut opening that
+   * associates with the void before proximity can score VICTIM_ACCESSED.
    */
   setVictims(list) {
     this.victims = list.map((v, i) => ({
@@ -777,6 +958,7 @@ export class RescuerAgent {
       x: v.x, y: v.y, z: v.z,
       voidRef: v.voidRef || null,
       lost: false,
+      ingressUnlocked: !!v.ingressUnlocked,
     }));
   }
 
@@ -789,15 +971,62 @@ export class RescuerAgent {
     }
   }
 
+  /**
+   * If the capsule is inside / through a registered cutter or hammer opening, unlock
+   * victims whose voids sit under or near that opening.
+   */
+  _checkOpeningIngress() {
+    if (!this.sim?.openingIngressAt || !this.victims.length) return;
+    const t = this.translation();
+    const hit = this.sim.openingIngressAt(
+      t.x, t.y, t.z,
+      this.capHalf + this.capRadius,
+    );
+    if (!hit) return;
+    this._unlockVictimsNearOpening(hit);
+  }
+
+  /**
+   * Associate an opening with nearby voids that lie at or below it, and mark those
+   * victims as enterable for scoring.
+   */
+  _unlockVictimsNearOpening(opening) {
+    const margin = 1.0;
+    for (const v of this.victims) {
+      if (v.lost || v.ingressUnlocked) continue;
+      const vr = v.voidRef;
+      if (!vr) continue;
+      // Void pocket should be at or below the opening (searching downward into rubble).
+      if (vr.y > opening.y + 0.75) continue;
+      const dist = Math.hypot(vr.x - opening.x, vr.z - opening.z);
+      const reach = (vr.radius || 0.5) + opening.radius + margin;
+      if (dist <= reach) {
+        v.ingressUnlocked = true;
+        this.emit({ type: 'INGRESS_UNLOCKED', victimId: v.id, x: opening.x, y: opening.y, z: opening.z });
+      }
+    }
+  }
+
+  /**
+   * Score +1 only when the rescuer is within touch range of a victim whose void was
+   * unlocked by entering a cut opening, and the void is not compromised.
+   */
   _checkVictimAccess() {
     const t = this.translation();
     for (const v of this.victims) {
-      if (v.lost || this.accessed.has(v.id)) continue;
+      if (v.lost || this.accessed.has(v.id) || !v.ingressUnlocked) continue;
       const d = Math.hypot(t.x - v.x, t.y - v.y, t.z - v.z);
       if (d <= ACCESS_RADIUS + CAPSULE_RADIUS) {
         this.accessed.add(v.id);
         this.emit({ type: 'VICTIM_ACCESSED', victimId: v.id, x: v.x, y: v.y, z: v.z });
       }
+    }
+  }
+
+  /** Test helper: force-unlock a victim for ingress (skips hole transit). */
+  unlockVictimIngress(victimId) {
+    for (const v of this.victims) {
+      if (v.id === victimId || victimId == null) v.ingressUnlocked = true;
     }
   }
 
@@ -872,7 +1101,7 @@ export class RescuerAgent {
     }
     this._setPose({
       x: t.x,
-      y: groundY + CAPSULE_HALF + CAPSULE_RADIUS + 0.02,
+      y: groundY + this.capHalf + this.capRadius + 0.02,
       z: t.z,
     });
     // Latch onto the floor with a short downward wish so grounding is real, not assumed.
